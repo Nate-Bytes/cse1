@@ -12,30 +12,221 @@ if (isset($_GET['logout'])) {
 
 $error = null;
 $message = null;
+$page = $_GET['page'] ?? 'dashboard';
 
 if (!isLoggedIn()) {
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['login'])) {
-        $email = trim((string) ($_POST['email'] ?? ''));
-        $password = (string) ($_POST['password'] ?? '');
+        if (!hasValidCsrfToken()) {
+            $error = 'Your session expired. Please try again.';
+        } else {
+            $email = trim((string) ($_POST['email'] ?? ''));
+            $password = (string) ($_POST['password'] ?? '');
+            $user = getUserByEmail($db, $email);
 
-        $user = getUserByEmail($db, $email);
-
-        if ($user && password_verify($password, $user['password_hash']) && (int) $user['is_active'] === 1) {
-            $_SESSION['user_id'] = (int) $user['id'];
-            $_SESSION['user_name'] = $user['name'];
-            $_SESSION['user_role'] = $user['role'];
-            header('Location: index.php?page=dashboard');
-            exit;
+            if ($user && password_verify($password, $user['password_hash']) && (int) $user['is_active'] === 1) {
+                if ((int) $user['totp_enabled'] === 1) {
+                    if (!empty($user['totp_locked_until']) && strtotime($user['totp_locked_until']) > time()) {
+                        $error = 'Too many incorrect codes. Please wait five minutes before trying again.';
+                    } else {
+                        if (!empty($user['totp_locked_until'])) {
+                            $reset = $db->prepare('UPDATE USERS SET totp_failed_attempts = 0, totp_locked_until = NULL WHERE id = :id');
+                            $reset->execute(['id' => $user['id']]);
+                        }
+                        session_regenerate_id(true);
+                        unset($_SESSION['csrf_token']);
+                        $_SESSION['pending_2fa_user_id'] = (int) $user['id'];
+                        $_SESSION['pending_2fa_attempts'] = 0;
+                    }
+                } else {
+                    completeLogin($user);
+                    header('Location: index.php?page=dashboard');
+                    exit;
+                }
+            } else {
+                $error = 'Invalid email or password.';
+            }
         }
 
-        $error = 'Invalid email or password.';
+    } elseif ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['verify_2fa'])) {
+        if (!hasValidCsrfToken()) {
+            $error = 'Your session expired. Please sign in again.';
+            unset($_SESSION['pending_2fa_user_id'], $_SESSION['pending_2fa_attempts']);
+        } elseif (!empty($_SESSION['pending_2fa_user_id'])) {
+            $user = getUserById($db, (int) $_SESSION['pending_2fa_user_id']);
+            if (!$user || (int) $user['is_active'] !== 1 || (int) $user['totp_enabled'] !== 1) {
+                unset($_SESSION['pending_2fa_user_id'], $_SESSION['pending_2fa_attempts']);
+                $error = 'Sign-in could not be verified. Please sign in again.';
+            } elseif (!empty($user['totp_locked_until']) && strtotime($user['totp_locked_until']) > time()) {
+                unset($_SESSION['pending_2fa_user_id'], $_SESSION['pending_2fa_attempts']);
+                $error = 'Too many incorrect codes. Please wait five minutes before trying again.';
+            } elseif (empty($user['totp_secret'])) {
+                unset($_SESSION['pending_2fa_user_id'], $_SESSION['pending_2fa_attempts']);
+                $error = 'Two-factor sign-in is not configured correctly. Contact the system administrator.';
+            } else {
+                try {
+                    $secret = decryptTotpSecret($user['totp_secret']);
+                    $lastCounter = $user['totp_last_used'] === null ? null : (int) $user['totp_last_used'];
+                    $counter = verifyTotpCode($secret, trim((string) ($_POST['totp_code'] ?? '')), $lastCounter);
+                } catch (RuntimeException $e) {
+                    $counter = null;
+                    $error = $e->getMessage();
+                }
+
+                if ($counter !== null) {
+                    $update = $db->prepare(
+                        'UPDATE USERS SET totp_last_used = :counter, totp_failed_attempts = 0, totp_locked_until = NULL ' .
+                        'WHERE id = :id AND totp_enabled = 1 AND (totp_last_used IS NULL OR totp_last_used < :previous_counter)'
+                    );
+                    $update->execute([
+                        'counter' => $counter,
+                        'id' => $user['id'],
+                        'previous_counter' => $counter,
+                    ]);
+
+                    if ($update->rowCount() === 1) {
+                        completeLogin($user);
+                        header('Location: index.php?page=dashboard');
+                        exit;
+                    }
+                    $error = 'That code has already been used. Enter the next code from your authenticator app.';
+                }
+
+                if ($counter === null || $update->rowCount() !== 1) {
+                    if ($error === null) {
+                        $recordFailure = $db->prepare(
+                            'UPDATE USERS SET totp_failed_attempts = totp_failed_attempts + 1, ' .
+                            'totp_locked_until = CASE WHEN totp_failed_attempts + 1 >= 5 ' .
+                            'THEN DATE_ADD(NOW(), INTERVAL 5 MINUTE) ELSE NULL END WHERE id = :id'
+                        );
+                        $recordFailure->execute(['id' => $user['id']]);
+                        $status = getUserById($db, (int) $user['id']);
+                        $attempts = (int) $status['totp_failed_attempts'];
+                        $error = $attempts >= 5
+                            ? 'Too many incorrect codes. Please wait five minutes before trying again.'
+                            : 'The authenticator code is invalid or expired.';
+                        if ($attempts >= 5) {
+                            unset($_SESSION['pending_2fa_user_id'], $_SESSION['pending_2fa_attempts']);
+                        }
+                    }
+                }
+            }
+        } else {
+            $error = 'Sign-in session expired. Please enter your email and password again.';
+        }
+    } elseif (isset($_GET['cancel_2fa'])) {
+        unset($_SESSION['pending_2fa_user_id'], $_SESSION['pending_2fa_attempts']);
+        header('Location: index.php');
+        exit;
     }
 
+    if (!empty($_SESSION['pending_2fa_user_id'])) {
+        echo renderTotpLoginPage($error);
+        exit;
+    }
     echo renderLoginPage($message, $error);
     exit;
 }
 
 requireLogin();
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['begin_totp_setup'])) {
+    if (!hasValidCsrfToken()) {
+        $error = 'Your session expired. Reload this page and try again.';
+    } else {
+        $user = getUserById($db, (int) $_SESSION['user_id']);
+        if (!$user || !password_verify((string) ($_POST['current_password'] ?? ''), $user['password_hash'])) {
+            $error = 'Enter your current password to set up 2FA.';
+        } elseif ((int) $user['totp_enabled'] === 1) {
+            $error = 'Two-factor authentication is already enabled.';
+        } else {
+            try {
+                totpEncryptionKey();
+                $_SESSION['totp_setup_secret'] = generateTotpSecret();
+                $_SESSION['totp_setup_attempts'] = 0;
+                $message = 'Add the secret to your authenticator app, then enter its current six-digit code below.';
+            } catch (RuntimeException $e) {
+                $error = $e->getMessage();
+            }
+        }
+    }
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['confirm_totp_setup'])) {
+    if (!hasValidCsrfToken()) {
+        $error = 'Your session expired. Reload this page and try again.';
+    } elseif (empty($_SESSION['totp_setup_secret'])) {
+        $error = 'Start 2FA setup again before confirming a code.';
+    } else {
+        $secret = (string) $_SESSION['totp_setup_secret'];
+        $counter = verifyTotpCode($secret, trim((string) ($_POST['totp_code'] ?? '')));
+        if ($counter === null) {
+            $_SESSION['totp_setup_attempts'] = (int) ($_SESSION['totp_setup_attempts'] ?? 0) + 1;
+            $error = 'The authenticator code is invalid or expired.';
+            if ($_SESSION['totp_setup_attempts'] >= 5) {
+                unset($_SESSION['totp_setup_secret'], $_SESSION['totp_setup_attempts']);
+                $error = 'Too many incorrect codes. Start 2FA setup again.';
+            }
+        } else {
+            try {
+                $encryptedSecret = encryptTotpSecret($secret);
+            } catch (RuntimeException $e) {
+                $error = $e->getMessage();
+                $encryptedSecret = null;
+            }
+
+            if ($encryptedSecret !== null) {
+                $save = $db->prepare(
+                    'UPDATE USERS SET totp_secret = :secret, totp_enabled = 1, totp_last_used = :counter, ' .
+                    'totp_failed_attempts = 0, totp_locked_until = NULL WHERE id = :id AND totp_enabled = 0'
+                );
+                $save->execute([
+                    'secret' => $encryptedSecret,
+                    'counter' => $counter,
+                    'id' => $_SESSION['user_id'],
+                ]);
+                if ($save->rowCount() === 1) {
+                    unset($_SESSION['totp_setup_secret'], $_SESSION['totp_setup_attempts']);
+                    $message = 'Two-factor authentication is now enabled for this account.';
+                } else {
+                    $error = '2FA could not be enabled. Reload the page and check your account status.';
+                }
+            }
+        }
+    }
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['disable_totp'])) {
+    if (!hasValidCsrfToken()) {
+        $error = 'Your session expired. Reload this page and try again.';
+    } else {
+        $user = getUserById($db, (int) $_SESSION['user_id']);
+        if (!$user || !password_verify((string) ($_POST['current_password'] ?? ''), $user['password_hash'])) {
+            $error = 'Enter your current password and authenticator code to turn off 2FA.';
+        } elseif ((int) $user['totp_enabled'] !== 1) {
+            $error = 'Two-factor authentication is not enabled.';
+        } elseif (empty($user['totp_secret'])) {
+            $error = 'Two-factor authentication is not configured correctly. Contact the system administrator.';
+        } else {
+            try {
+                $secret = decryptTotpSecret($user['totp_secret']);
+                $lastCounter = $user['totp_last_used'] === null ? null : (int) $user['totp_last_used'];
+                $counter = verifyTotpCode($secret, trim((string) ($_POST['totp_code'] ?? '')), $lastCounter);
+                if ($counter === null) {
+                    $error = 'The authenticator code is invalid or expired.';
+                } else {
+                    $disable = $db->prepare(
+                        'UPDATE USERS SET totp_secret = NULL, totp_enabled = 0, totp_last_used = NULL, ' .
+                        'totp_failed_attempts = 0, totp_locked_until = NULL WHERE id = :id AND totp_enabled = 1'
+                    );
+                    $disable->execute(['id' => $user['id']]);
+                    $message = 'Two-factor authentication has been turned off.';
+                }
+            } catch (RuntimeException $e) {
+                $error = $e->getMessage();
+            }
+        }
+    }
+}
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_product'])) {
     $id = isset($_POST['id']) && $_POST['id'] !== '' ? (int) $_POST['id'] : null;
@@ -179,9 +370,65 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['post_stock'])) {
     }
 }
 
-$page = $_GET['page'] ?? 'dashboard';
+if ($page === 'security') {
+    $account = getUserById($db, (int) $_SESSION['user_id']);
+    $twoFactorEnabled = $account && (int) $account['totp_enabled'] === 1;
+    $content = '<div class="card"><h2>Account security</h2>';
+    if ($message) { $content .= '<div class="alert success">' . e($message) . '</div>'; }
+    if ($error) { $content .= '<div class="alert error">' . e($error) . '</div>'; }
+    $content .= '<p>Two-factor authentication is optional. Turn it on for this account here; repeat these steps with each demo account you want to protect.</p>';
 
-if ($page === 'products') {
+    if ($twoFactorEnabled) {
+        $content .= '<p>Two-factor authentication is <strong>enabled</strong> for this account.</p>';
+        $content .= '<h3>Turn off two-factor authentication</h3>';
+        $content .= '<p class="muted">Confirm with your account password and a current authenticator code.</p>';
+        $content .= '<form method="post">
+            <input type="hidden" name="csrf_token" value="' . e(csrfToken()) . '">
+            <div class="field"><label for="disable_password">Current password</label><input id="disable_password" type="password" name="current_password" required autocomplete="current-password"></div>
+            <div class="field"><label for="disable_code">Authenticator code</label><input id="disable_code" type="text" name="totp_code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required autocomplete="one-time-code"></div>
+            <button type="submit" name="disable_totp" class="btn danger">Turn off 2FA</button>
+        </form>';
+    } elseif (!empty($_SESSION['totp_setup_secret'])) {
+        $secret = (string) $_SESSION['totp_setup_secret'];
+        $label = rawurlencode('CSE1 Inventory:' . $account['email']);
+        $otpauthUri = 'otpauth://totp/' . $label . '?secret=' . rawurlencode($secret) . '&issuer=CSE1%20Inventory&algorithm=SHA1&digits=6&period=30';
+        $content .= '<p>Scan this QR code with your authenticator app. Keep it private; anyone who scans it can generate sign-in codes for your account.</p>
+            <div id="totp-qr" class="qr-code" role="img" aria-label="Authenticator setup QR code" data-qr-value="' . e($otpauthUri) . '"></div>
+            <p class="muted">If you cannot scan the QR code, choose manual setup in your authenticator app and enter these details:</p>
+            <ul><li>Account: ' . e($account['email']) . '</li><li>Setup key: <code>' . e($secret) . '</code></li><li>Type: time-based (TOTP)</li></ul>
+            <p id="totp-qr-error" class="alert error" hidden>The QR code could not be displayed. Use the setup key above instead.</p>
+            <form method="post">
+                <input type="hidden" name="csrf_token" value="' . e(csrfToken()) . '">
+                <div class="field"><label for="setup_code">Verify setup with an authenticator code</label><input id="setup_code" type="text" name="totp_code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required autocomplete="one-time-code"></div>
+                <button type="submit" name="confirm_totp_setup" class="btn">Verify and enable 2FA</button>
+            </form>
+            <script src="assets/vendor/qrcode.js"></script>
+            <script src="assets/vendor/qrcode_UTF8.js"></script>
+            <script>
+                (function () {
+                    var target = document.getElementById("totp-qr");
+                    var fallback = document.getElementById("totp-qr-error");
+                    try {
+                        var qr = qrcode(0, "M");
+                        qr.addData(target.getAttribute("data-qr-value"), "Byte");
+                        qr.make();
+                        target.innerHTML = qr.createSvgTag(5, 4);
+                    } catch (error) {
+                        fallback.hidden = false;
+                    }
+                }());
+            </script>';
+    } else {
+        $content .= '<p>Two-factor authentication is <strong>off</strong> for this account.</p>';
+        $content .= '<p>Use an authenticator app such as Google Authenticator, Microsoft Authenticator, or Authy. Setup requires your current password.</p>';
+        $content .= '<form method="post">
+            <input type="hidden" name="csrf_token" value="' . e(csrfToken()) . '">
+            <div class="field"><label for="setup_password">Current password</label><input id="setup_password" type="password" name="current_password" required autocomplete="current-password"></div>
+            <button type="submit" name="begin_totp_setup" class="btn">Enable 2FA for this account</button>
+        </form>';
+    }
+    $content .= '</div>';
+} elseif ($page === 'products') {
     $search = trim((string) ($_GET['q'] ?? ''));
     $query = 'SELECT p.*, s.name AS supplier_name FROM PRODUCTS p LEFT JOIN SUPPLIERS s ON s.id = p.supplier_id WHERE p.is_active = 1';
     $params = [];

@@ -9,6 +9,11 @@ CREATE TABLE USERS (
     password_hash VARCHAR(255) NOT NULL,
     role ENUM('Admin', 'Manager', 'Staff') NOT NULL,
     is_active TINYINT(1) NOT NULL DEFAULT 1,
+    totp_secret TEXT DEFAULT NULL,
+    totp_enabled TINYINT(1) NOT NULL DEFAULT 0,
+    totp_last_used BIGINT UNSIGNED DEFAULT NULL,
+    totp_failed_attempts TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    totp_locked_until DATETIME DEFAULT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 

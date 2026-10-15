@@ -12,7 +12,7 @@ if (isset($_GET['logout'])) {
 
 $error = null;
 $message = null;
-$page = $_GET['page'] ?? 'dashboard';
+$page = isset($_GET['page']) && is_string($_GET['page']) ? $_GET['page'] : 'dashboard';
 
 if (!isLoggedIn()) {
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['login'])) {
@@ -129,6 +129,49 @@ if (!isLoggedIn()) {
 
 requireLogin();
 
+$role = (string) $_SESSION['user_role'];
+$user = ['name' => $_SESSION['user_name'], 'role' => $role];
+$canManageCatalog = in_array($role, ['Admin', 'Manager'], true);
+
+function denyAccess(string $text, string $page, array $user): void
+{
+    http_response_code(403);
+    echo renderLayout('Access denied', '<div class="card"><h2>Access denied</h2><p>' . e($text) . '</p></div>', $page, $user);
+    exit;
+}
+
+// Access control runs BEFORE any handler, so a forbidden request never changes data.
+$catalogActions = ['save_product', 'toggle_product', 'save_supplier', 'toggle_supplier'];
+$inventoryActions = array_merge($catalogActions, ['post_stock']);
+
+if ($page === 'suppliers' && !$canManageCatalog) {
+    denyAccess('You are not allowed to access supplier management.', $page, $user);
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    foreach ($catalogActions as $action) {
+        if (isset($_POST[$action]) && !$canManageCatalog) {
+            denyAccess('You are not allowed to change the product or supplier catalog.', $page, $user);
+        }
+    }
+
+    if (isset($_POST['post_stock']) && !in_array($role, ['Admin', 'Manager', 'Staff'], true)) {
+        denyAccess('You are not allowed to post stock movements.', $page, $user);
+    }
+
+    // CSRF check for every inventory write; a bad token cancels the action.
+    foreach ($inventoryActions as $action) {
+        if (isset($_POST[$action]) && !hasValidCsrfToken()) {
+            foreach ($inventoryActions as $cancelled) {
+                unset($_POST[$cancelled]);
+            }
+            $error = 'Your session expired. Reload the page and try again.';
+            break;
+        }
+    }
+}
+
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['begin_totp_setup'])) {
     if (!hasValidCsrfToken()) {
         $error = 'Your session expired. Reload this page and try again.';
@@ -233,43 +276,108 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_product'])) {
     $supplierId = (int) ($_POST['supplier_id'] ?? 0);
     $name = trim((string) ($_POST['name'] ?? ''));
     $sku = trim((string) ($_POST['sku'] ?? ''));
-    $reorderLevel = (int) ($_POST['reorder_level'] ?? 0);
-    $quantity = (int) ($_POST['quantity'] ?? 0);
+    $reorderLevel = filter_var($_POST['reorder_level'] ?? '', FILTER_VALIDATE_INT);
+    // Quantity is only accepted when creating a product (opening balance).
+    // Editing never changes stock; use Stock Movement so history stays accurate.
+    $quantity = $id ? 0 : filter_var($_POST['quantity'] ?? '0', FILTER_VALIDATE_INT);
 
-    if ($supplierId > 0 && $name !== '' && $sku !== '') {
-        if ($id) {
-            $stmt = $db->prepare('UPDATE PRODUCTS SET supplier_id = :supplier_id, name = :name, sku = :sku, reorder_level = :reorder_level, quantity = :quantity WHERE id = :id');
-            $stmt->execute([
-                'supplier_id' => $supplierId,
-                'name' => $name,
-                'sku' => $sku,
-                'reorder_level' => $reorderLevel,
-                'quantity' => $quantity,
-                'id' => $id,
-            ]);
-            $message = 'Product updated.';
-        } else {
-            $stmt = $db->prepare('INSERT INTO PRODUCTS (supplier_id, name, sku, quantity, reorder_level, is_active, created_at) VALUES (:supplier_id, :name, :sku, :quantity, :reorder_level, 1, NOW())');
-            $stmt->execute([
-                'supplier_id' => $supplierId,
-                'name' => $name,
-                'sku' => $sku,
-                'quantity' => $quantity,
-                'reorder_level' => $reorderLevel,
-            ]);
-            $message = 'Product added.';
+    $current = null;
+    if ($id) {
+        $stmt = $db->prepare('SELECT supplier_id FROM PRODUCTS WHERE id = :id');
+        $stmt->execute(['id' => $id]);
+        $current = $stmt->fetch() ?: null;
+    }
+
+    $supplierOk = false;
+    if ($supplierId > 0) {
+        $stmt = $db->prepare('SELECT is_active FROM SUPPLIERS WHERE id = :id');
+        $stmt->execute(['id' => $supplierId]);
+        $supplierRow = $stmt->fetch();
+        if ($supplierRow) {
+            // An inactive supplier is only allowed if the product already uses it.
+            $supplierOk = (int) $supplierRow['is_active'] === 1
+                || ($current !== null && (int) $current['supplier_id'] === $supplierId);
         }
+    }
+
+    if ($name === '' || $sku === '' || !$supplierOk) {
+        $error = 'Please complete all product fields and choose a valid supplier.';
+    } elseif (mb_strlen($name) > 150 || mb_strlen($sku) > 100) {
+        $error = 'Product name (150) or SKU (100) is too long.';
+    } elseif ($reorderLevel === false || $reorderLevel < 0) {
+        $error = 'Reorder level must be a whole number of 0 or more.';
+    } elseif ($quantity === false || $quantity < 0) {
+        $error = 'Quantity must be a whole number of 0 or more.';
+    } elseif ($id && $current === null) {
+        $error = 'Product not found.';
     } else {
-        $error = 'Please complete all product fields.';
+        try {
+            if ($id) {
+                $stmt = $db->prepare('UPDATE PRODUCTS SET supplier_id = :supplier_id, name = :name, sku = :sku, reorder_level = :reorder_level WHERE id = :id');
+                $stmt->execute([
+                    'supplier_id' => $supplierId,
+                    'name' => $name,
+                    'sku' => $sku,
+                    'reorder_level' => $reorderLevel,
+                    'id' => $id,
+                ]);
+                $message = 'Product updated.';
+            } else {
+                $db->beginTransaction();
+                $stmt = $db->prepare('INSERT INTO PRODUCTS (supplier_id, name, sku, quantity, reorder_level, is_active, created_at) VALUES (:supplier_id, :name, :sku, :quantity, :reorder_level, 1, NOW())');
+                $stmt->execute([
+                    'supplier_id' => $supplierId,
+                    'name' => $name,
+                    'sku' => $sku,
+                    'quantity' => $quantity,
+                    'reorder_level' => $reorderLevel,
+                ]);
+                $newProductId = (int) $db->lastInsertId();
+
+                // Record the opening balance so before/after history matches real stock.
+                if ($quantity > 0) {
+                    $opening = $db->prepare(
+                        'INSERT INTO TRANSACTION_HISTORY (product_id, type, quantity, before_quantity, after_quantity, notes, user_id, created_at) ' .
+                        'VALUES (:product_id, \'IN\', :quantity, 0, :after_quantity, :notes, :user_id, NOW())'
+                    );
+                    $opening->execute([
+                        'product_id' => $newProductId,
+                        'quantity' => $quantity,
+                        'after_quantity' => $quantity,
+                        'notes' => 'Opening balance',
+                        'user_id' => $_SESSION['user_id'],
+                    ]);
+                }
+                $db->commit();
+                $message = 'Product added.';
+            }
+        } catch (PDOException $ex) {
+            if ($db->inTransaction()) {
+                $db->rollBack();
+            }
+            $error = (int) ($ex->errorInfo[1] ?? 0) === 1062
+                ? 'That SKU already exists. Use a different SKU.'
+                : 'The product could not be saved. Please try again.';
+        }
     }
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['toggle_product'])) {
     $id = (int) ($_POST['product_id'] ?? 0);
     if ($id > 0) {
-        $stmt = $db->prepare('UPDATE PRODUCTS SET is_active = 1 - is_active WHERE id = :id');
+        $stmt = $db->prepare('SELECT p.is_active, s.is_active AS supplier_active FROM PRODUCTS p LEFT JOIN SUPPLIERS s ON s.id = p.supplier_id WHERE p.id = :id');
         $stmt->execute(['id' => $id]);
-        $message = 'Product status changed.';
+        $row = $stmt->fetch();
+
+        if (!$row) {
+            $error = 'Product not found.';
+        } elseif ((int) $row['is_active'] === 0 && (int) $row['supplier_active'] !== 1) {
+            $error = 'Reactivate this product\'s supplier first, or edit the product to use an active supplier.';
+        } else {
+            $stmt = $db->prepare('UPDATE PRODUCTS SET is_active = 1 - is_active WHERE id = :id');
+            $stmt->execute(['id' => $id]);
+            $message = (int) $row['is_active'] === 1 ? 'Product deactivated.' : 'Product reactivated.';
+        }
     }
 }
 
@@ -280,38 +388,63 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_supplier'])) {
     $phone = trim((string) ($_POST['phone'] ?? ''));
     $email = trim((string) ($_POST['email'] ?? ''));
 
-    if ($name !== '') {
-        if ($id) {
-            $stmt = $db->prepare('UPDATE SUPPLIERS SET name = :name, contact_person = :contact_person, phone = :phone, email = :email WHERE id = :id');
-            $stmt->execute([
-                'name' => $name,
-                'contact_person' => $contactPerson,
-                'phone' => $phone,
-                'email' => $email,
-                'id' => $id,
-            ]);
-            $message = 'Supplier updated.';
-        } else {
-            $stmt = $db->prepare('INSERT INTO SUPPLIERS (name, contact_person, phone, email, is_active, created_at) VALUES (:name, :contact_person, :phone, :email, 1, NOW())');
-            $stmt->execute([
-                'name' => $name,
-                'contact_person' => $contactPerson,
-                'phone' => $phone,
-                'email' => $email,
-            ]);
-            $message = 'Supplier added.';
-        }
-    } else {
+    if ($name === '') {
         $error = 'Supplier name is required.';
+    } elseif (mb_strlen($name) > 150 || mb_strlen($contactPerson) > 100 || mb_strlen($phone) > 30 || mb_strlen($email) > 100) {
+        $error = 'One of the supplier fields is too long.';
+    } elseif ($email !== '' && !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        $error = 'Enter a valid supplier email address.';
+    } else {
+        $params = [
+            'name' => $name,
+            'contact_person' => $contactPerson !== '' ? $contactPerson : null,
+            'phone' => $phone !== '' ? $phone : null,
+            'email' => $email !== '' ? $email : null,
+        ];
+        try {
+            if ($id) {
+                $stmt = $db->prepare('UPDATE SUPPLIERS SET name = :name, contact_person = :contact_person, phone = :phone, email = :email WHERE id = :id');
+                $params['id'] = $id;
+                $stmt->execute($params);
+                $message = 'Supplier updated.';
+            } else {
+                $stmt = $db->prepare('INSERT INTO SUPPLIERS (name, contact_person, phone, email, is_active, created_at) VALUES (:name, :contact_person, :phone, :email, 1, NOW())');
+                $stmt->execute($params);
+                $message = 'Supplier added.';
+            }
+        } catch (PDOException $ex) {
+            $error = 'The supplier could not be saved. Please try again.';
+        }
     }
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['toggle_supplier'])) {
     $id = (int) ($_POST['supplier_id'] ?? 0);
     if ($id > 0) {
-        $stmt = $db->prepare('UPDATE SUPPLIERS SET is_active = 1 - is_active WHERE id = :id');
+        $stmt = $db->prepare('SELECT is_active FROM SUPPLIERS WHERE id = :id');
         $stmt->execute(['id' => $id]);
-        $message = 'Supplier status changed.';
+        $row = $stmt->fetch();
+
+        if (!$row) {
+            $error = 'Supplier not found.';
+        } else {
+            $blocked = false;
+            if ((int) $row['is_active'] === 1) {
+                $count = $db->prepare('SELECT COUNT(*) FROM PRODUCTS WHERE supplier_id = :id AND is_active = 1');
+                $count->execute(['id' => $id]);
+                $activeProducts = (int) $count->fetchColumn();
+                if ($activeProducts > 0) {
+                    $blocked = true;
+                    $error = 'This supplier still has ' . $activeProducts . ' active product(s). Deactivate or reassign them first.';
+                }
+            }
+
+            if (!$blocked) {
+                $stmt = $db->prepare('UPDATE SUPPLIERS SET is_active = 1 - is_active WHERE id = :id');
+                $stmt->execute(['id' => $id]);
+                $message = (int) $row['is_active'] === 1 ? 'Supplier deactivated.' : 'Supplier reactivated.';
+            }
+        }
     }
 }
 
@@ -319,19 +452,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['post_stock'])) {
     $productId = (int) ($_POST['product_id'] ?? 0);
     $type = strtoupper((string) ($_POST['type'] ?? ''));
     $quantity = (int) ($_POST['quantity'] ?? 0);
-    $notes = trim((string) ($_POST['notes'] ?? ''));
+    $notes = mb_substr(trim((string) ($_POST['notes'] ?? '')), 0, 255);
 
     if ($productId <= 0 || !in_array($type, ['IN', 'OUT'], true) || $quantity <= 0) {
         $error = 'Please select a valid product, movement type, and quantity greater than zero.';
     } else {
         try {
             $db->beginTransaction();
-            $sel = $db->prepare('SELECT quantity FROM PRODUCTS WHERE id = :id FOR UPDATE');
+            $sel = $db->prepare('SELECT quantity, is_active FROM PRODUCTS WHERE id = :id FOR UPDATE');
             $sel->execute(['id' => $productId]);
             $product = $sel->fetch();
 
             if (!$product) {
                 throw new RuntimeException('Product not found.');
+            }
+
+            if ((int) $product['is_active'] !== 1) {
+                throw new RuntimeException('Stock cannot be moved for an inactive product.');
             }
 
             $before = (int) $product['quantity'];
@@ -363,9 +500,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['post_stock'])) {
 
             $db->commit();
             $message = 'Stock movement recorded successfully.';
-        } catch (Throwable $e) {
-            $db->rollBack();
-            $error = $e->getMessage();
+        } catch (RuntimeException $ex) {
+            if ($db->inTransaction()) {
+                $db->rollBack();
+            }
+            $error = $ex->getMessage();
+        } catch (Throwable $ex) {
+            if ($db->inTransaction()) {
+                $db->rollBack();
+            }
+            $error = 'The stock movement could not be recorded. Please try again.';
         }
     }
 }
@@ -430,12 +574,17 @@ if ($page === 'security') {
     $content .= '</div>';
 } elseif ($page === 'products') {
     $search = trim((string) ($_GET['q'] ?? ''));
-    $query = 'SELECT p.*, s.name AS supplier_name FROM PRODUCTS p LEFT JOIN SUPPLIERS s ON s.id = p.supplier_id WHERE p.is_active = 1';
-    $params = [];
+    $status = ($_GET['status'] ?? 'active') === 'inactive' ? 'inactive' : 'active';
+    $query = 'SELECT p.*, s.name AS supplier_name FROM PRODUCTS p LEFT JOIN SUPPLIERS s ON s.id = p.supplier_id WHERE p.is_active = :is_active';
+    $params = ['is_active' => $status === 'active' ? 1 : 0];
 
     if ($search !== '') {
-        $query .= ' AND (p.name LIKE :search OR p.sku LIKE :search OR s.name LIKE :search)';
-        $params['search'] = '%' . $search . '%';
+        // Native prepared statements cannot reuse one named parameter, so each use gets its own.
+        $query .= ' AND (p.name LIKE :search1 OR p.sku LIKE :search2 OR s.name LIKE :search3)';
+        $like = '%' . $search . '%';
+        $params['search1'] = $like;
+        $params['search2'] = $like;
+        $params['search3'] = $like;
     }
 
     $query .= ' ORDER BY p.name ASC';
@@ -443,55 +592,82 @@ if ($page === 'security') {
     $stmt->execute($params);
     $products = $stmt->fetchAll();
 
-    $productId = isset($_GET['edit_product']) ? (int) $_GET['edit_product'] : 0;
+    $productId = $canManageCatalog && isset($_GET['edit_product']) ? (int) $_GET['edit_product'] : 0;
     $editingProduct = null;
     if ($productId > 0) {
         $stmt = $db->prepare('SELECT * FROM PRODUCTS WHERE id = :id');
         $stmt->execute(['id' => $productId]);
-        $editingProduct = $stmt->fetch();
+        $editingProduct = $stmt->fetch() ?: null;
     }
 
-    $suppliers = getSupplierOptions($db);
-    $content = '<div class="notice">Phase 1 (50% complete). Locked for next phase: bulk import/export, advanced reporting, and full user administration.</div>'; 
+    $suppliers = getSupplierOptions($db, $editingProduct ? (int) $editingProduct['supplier_id'] : null);
+    $csrfField = '<input type="hidden" name="csrf_token" value="' . e(csrfToken()) . '">';
+    $columns = $canManageCatalog ? 6 : 5;
+
+    $content = '<div class="notice">Phase 1 (50% complete). Locked for next phase: bulk import/export, advanced reporting, and full user administration.</div>';
     $content .= '<div class="card"><h2>Products</h2>';
     if ($message) { $content .= '<div class="alert success">' . e($message) . '</div>'; }
     if ($error) { $content .= '<div class="alert error">' . e($error) . '</div>'; }
     $content .= '<div class="inline" style="margin-bottom: 16px;">';
     $content .= '<form method="get" style="display:flex; gap:10px; align-items:end; width: 100%;">';
-    $content .= '<input type="hidden" name="page" value="products">';
+    $content .= '<input type="hidden" name="page" value="products"><input type="hidden" name="status" value="' . e($status) . '">';
     $content .= '<div class="field" style="flex:1; min-width:180px;"><label>Search</label><input type="text" name="q" value="' . e($search) . '" placeholder="Product or SKU"></div>';
     $content .= '<button class="btn secondary" type="submit">Search</button>';
     $content .= '</form>';
     $content .= '</div>';
-    $content .= '<h3>' . ($editingProduct ? 'Edit Product' : 'Add Product') . '</h3>';
-    $content .= '<form method="post"><input type="hidden" name="id" value="' . ($editingProduct['id'] ?? '') . '"><div class="grid two-col"><div class="field"><label>Supplier</label><select name="supplier_id" required>';
-    foreach ($suppliers as $supplier) {
-        $selected = ($editingProduct && (int) $editingProduct['supplier_id'] === (int) $supplier['id']) ? ' selected' : '';
-        $content .= '<option value="' . (int) $supplier['id'] . '"' . $selected . '>' . e($supplier['name']) . '</option>';
+
+    if ($canManageCatalog) {
+        $content .= '<h3>' . ($editingProduct ? 'Edit Product' : 'Add Product') . '</h3>';
+        $content .= '<form method="post">' . $csrfField . '<input type="hidden" name="id" value="' . (int) ($editingProduct['id'] ?? 0) . '"><div class="grid two-col"><div class="field"><label>Supplier</label><select name="supplier_id" required>';
+        foreach ($suppliers as $supplier) {
+            $selected = ($editingProduct && (int) $editingProduct['supplier_id'] === (int) $supplier['id']) ? ' selected' : '';
+            $label = e($supplier['name']) . ((int) $supplier['is_active'] === 1 ? '' : ' (inactive)');
+            $content .= '<option value="' . (int) $supplier['id'] . '"' . $selected . '>' . $label . '</option>';
+        }
+        $content .= '</select></div><div class="field"><label>Name</label><input type="text" name="name" maxlength="150" value="' . e($editingProduct['name'] ?? '') . '" required></div><div class="field"><label>SKU</label><input type="text" name="sku" maxlength="100" value="' . e($editingProduct['sku'] ?? '') . '" required></div><div class="field"><label>Reorder Level</label><input type="number" name="reorder_level" min="0" step="1" value="' . (int) ($editingProduct['reorder_level'] ?? 5) . '" required></div>';
+        if ($editingProduct) {
+            $content .= '<div class="field"><label>Quantity on hand</label><input type="number" value="' . (int) $editingProduct['quantity'] . '" readonly disabled><span class="muted">Change stock from the Stock Movement page so history stays accurate.</span></div>';
+        } else {
+            $content .= '<div class="field"><label>Opening Quantity</label><input type="number" name="quantity" min="0" step="1" value="0" required></div>';
+        }
+        $content .= '</div><div class="inline"><button type="submit" name="save_product" class="btn">Save Product</button>';
+        if ($editingProduct) {
+            $content .= '<a href="index.php?page=products" class="btn secondary">Cancel</a>';
+        }
+        $content .= '</div></form>';
+    } else {
+        $content .= '<p class="muted">You have read-only access to the product catalog.</p>';
     }
-    $content .= '</select></div><div class="field"><label>Name</label><input type="text" name="name" value="' . e($editingProduct['name'] ?? '') . '" required></div><div class="field"><label>SKU</label><input type="text" name="sku" value="' . e($editingProduct['sku'] ?? '') . '" required></div><div class="field"><label>Reorder Level</label><input type="number" name="reorder_level" min="0" value="' . (int) ($editingProduct['reorder_level'] ?? 0) . '" required></div><div class="field"><label>Quantity</label><input type="number" name="quantity" min="0" value="' . (int) ($editingProduct['quantity'] ?? 0) . '" required></div></div><div class="inline"><button type="submit" name="save_product" class="btn">Save Product</button>';
-    if ($editingProduct) {
-        $content .= '<a href="index.php?page=products" class="btn secondary">Cancel</a>';
-    }
-    $content .= '</div></form>';
     $content .= '</div>';
-    $content .= '<div class="card"><h3>Product List</h3><table><thead><tr><th>Name</th><th>SKU</th><th>Supplier</th><th>Qty</th><th>Low</th><th>Action</th></tr></thead><tbody>';
+
+    $content .= '<div class="card"><h3>Product List</h3>';
+    $content .= '<p><a class="btn' . ($status === 'active' ? '' : ' secondary') . '" href="index.php?page=products&status=active">Active</a> <a class="btn' . ($status === 'inactive' ? '' : ' secondary') . '" href="index.php?page=products&status=inactive">Inactive</a></p>';
+    $content .= '<table><thead><tr><th>Name</th><th>SKU</th><th>Supplier</th><th>Qty</th><th>Low</th>' . ($canManageCatalog ? '<th>Action</th>' : '') . '</tr></thead><tbody>';
 
     if (empty($products)) {
-        $content .= '<tr><td colspan="6" class="muted">No products found.</td></tr>';
+        $content .= '<tr><td colspan="' . $columns . '" class="muted">No products found.</td></tr>';
     } else {
         foreach ($products as $product) {
-            $content .= '<tr><td>' . e($product['name']) . '</td><td>' . e($product['sku']) . '</td><td>' . e($product['supplier_name']) . '</td><td>' . (int) $product['quantity'] . '</td><td>' . (int) $product['reorder_level'] . '</td><td><a class="btn secondary" href="index.php?page=products&edit_product=' . (int) $product['id'] . '">Edit</a> <form method="post" style="display:inline"><input type="hidden" name="product_id" value="' . (int) $product['id'] . '"><button type="submit" name="toggle_product" class="btn danger">Deactivate</button></form></td></tr>';
+            $content .= '<tr><td>' . e($product['name']) . '</td><td>' . e($product['sku']) . '</td><td>' . e($product['supplier_name']) . '</td><td>' . (int) $product['quantity'] . '</td><td>' . (int) $product['reorder_level'] . '</td>';
+            if ($canManageCatalog) {
+                $content .= '<td><a class="btn secondary" href="index.php?page=products&edit_product=' . (int) $product['id'] . '">Edit</a> <form method="post" style="display:inline">' . $csrfField . '<input type="hidden" name="product_id" value="' . (int) $product['id'] . '"><button type="submit" name="toggle_product" class="btn ' . ($status === 'active' ? 'danger' : '') . '">' . ($status === 'active' ? 'Deactivate' : 'Reactivate') . '</button></form></td>';
+            }
+            $content .= '</tr>';
         }
     }
     $content .= '</tbody></table></div>';
 } elseif ($page === 'suppliers') {
     $search = trim((string) ($_GET['q'] ?? ''));
-    $query = 'SELECT * FROM SUPPLIERS WHERE is_active = 1';
-    $params = [];
+    $status = ($_GET['status'] ?? 'active') === 'inactive' ? 'inactive' : 'active';
+    $query = 'SELECT * FROM SUPPLIERS WHERE is_active = :is_active';
+    $params = ['is_active' => $status === 'active' ? 1 : 0];
     if ($search !== '') {
-        $query .= ' AND (name LIKE :search OR contact_person LIKE :search OR phone LIKE :search OR email LIKE :search)';
-        $params['search'] = '%' . $search . '%';
+        $query .= ' AND (name LIKE :search1 OR contact_person LIKE :search2 OR phone LIKE :search3 OR email LIKE :search4)';
+        $like = '%' . $search . '%';
+        $params['search1'] = $like;
+        $params['search2'] = $like;
+        $params['search3'] = $like;
+        $params['search4'] = $like;
     }
     $query .= ' ORDER BY name ASC';
     $stmt = $db->prepare($query);
@@ -503,26 +679,30 @@ if ($page === 'security') {
     if ($supplierId > 0) {
         $stmt = $db->prepare('SELECT * FROM SUPPLIERS WHERE id = :id');
         $stmt->execute(['id' => $supplierId]);
-        $editingSupplier = $stmt->fetch();
+        $editingSupplier = $stmt->fetch() ?: null;
     }
+
+    $csrfField = '<input type="hidden" name="csrf_token" value="' . e(csrfToken()) . '">';
 
     $content = '<div class="notice">Phase 1 (50% complete). Locked for next phase: supplier bulk actions and reporting.</div>';
     $content .= '<div class="card"><h2>Suppliers</h2>';
     if ($message) { $content .= '<div class="alert success">' . e($message) . '</div>'; }
     if ($error) { $content .= '<div class="alert error">' . e($error) . '</div>'; }
-    $content .= '<div class="inline" style="margin-bottom: 16px;"><form method="get" style="display:flex; gap:10px; width:100%; align-items:end;"><input type="hidden" name="page" value="suppliers"><div class="field" style="flex:1; min-width:180px;"><label>Search</label><input type="text" name="q" value="' . e($search) . '" placeholder="Supplier name"></div><button class="btn secondary" type="submit">Search</button></form></div>';
-    $content .= '<h3>' . ($editingSupplier ? 'Edit Supplier' : 'Add Supplier') . '</h3><form method="post"><input type="hidden" name="id" value="' . ($editingSupplier['id'] ?? '') . '"><div class="grid two-col"><div class="field"><label>Name</label><input type="text" name="name" value="' . e($editingSupplier['name'] ?? '') . '" required></div><div class="field"><label>Contact Person</label><input type="text" name="contact_person" value="' . e($editingSupplier['contact_person'] ?? '') . '"></div><div class="field"><label>Phone</label><input type="text" name="phone" value="' . e($editingSupplier['phone'] ?? '') . '"></div><div class="field"><label>Email</label><input type="email" name="email" value="' . e($editingSupplier['email'] ?? '') . '"></div></div><div class="inline"><button type="submit" name="save_supplier" class="btn">Save Supplier</button>';
+    $content .= '<div class="inline" style="margin-bottom: 16px;"><form method="get" style="display:flex; gap:10px; width:100%; align-items:end;"><input type="hidden" name="page" value="suppliers"><input type="hidden" name="status" value="' . e($status) . '"><div class="field" style="flex:1; min-width:180px;"><label>Search</label><input type="text" name="q" value="' . e($search) . '" placeholder="Supplier name"></div><button class="btn secondary" type="submit">Search</button></form></div>';
+    $content .= '<h3>' . ($editingSupplier ? 'Edit Supplier' : 'Add Supplier') . '</h3><form method="post">' . $csrfField . '<input type="hidden" name="id" value="' . (int) ($editingSupplier['id'] ?? 0) . '"><div class="grid two-col"><div class="field"><label>Name</label><input type="text" name="name" maxlength="150" value="' . e($editingSupplier['name'] ?? '') . '" required></div><div class="field"><label>Contact Person</label><input type="text" name="contact_person" maxlength="100" value="' . e($editingSupplier['contact_person'] ?? '') . '"></div><div class="field"><label>Phone</label><input type="text" name="phone" maxlength="30" value="' . e($editingSupplier['phone'] ?? '') . '"></div><div class="field"><label>Email</label><input type="email" name="email" maxlength="100" value="' . e($editingSupplier['email'] ?? '') . '"></div></div><div class="inline"><button type="submit" name="save_supplier" class="btn">Save Supplier</button>';
     if ($editingSupplier) {
         $content .= '<a href="index.php?page=suppliers" class="btn secondary">Cancel</a>';
     }
     $content .= '</div></form></div>';
-    $content .= '<div class="card"><h3>Supplier List</h3><table><thead><tr><th>Name</th><th>Contact</th><th>Phone</th><th>Email</th><th>Action</th></tr></thead><tbody>';
+    $content .= '<div class="card"><h3>Supplier List</h3>';
+    $content .= '<p><a class="btn' . ($status === 'active' ? '' : ' secondary') . '" href="index.php?page=suppliers&status=active">Active</a> <a class="btn' . ($status === 'inactive' ? '' : ' secondary') . '" href="index.php?page=suppliers&status=inactive">Inactive</a></p>';
+    $content .= '<table><thead><tr><th>Name</th><th>Contact</th><th>Phone</th><th>Email</th><th>Action</th></tr></thead><tbody>';
 
     if (empty($suppliers)) {
         $content .= '<tr><td colspan="5" class="muted">No suppliers found.</td></tr>';
     } else {
         foreach ($suppliers as $supplier) {
-            $content .= '<tr><td>' . e($supplier['name']) . '</td><td>' . e($supplier['contact_person']) . '</td><td>' . e($supplier['phone']) . '</td><td>' . e($supplier['email']) . '</td><td><a class="btn secondary" href="index.php?page=suppliers&edit_supplier=' . (int) $supplier['id'] . '">Edit</a> <form method="post" style="display:inline"><input type="hidden" name="supplier_id" value="' . (int) $supplier['id'] . '"><button type="submit" name="toggle_supplier" class="btn danger">Deactivate</button></form></td></tr>';
+            $content .= '<tr><td>' . e($supplier['name']) . '</td><td>' . e($supplier['contact_person']) . '</td><td>' . e($supplier['phone']) . '</td><td>' . e($supplier['email']) . '</td><td><a class="btn secondary" href="index.php?page=suppliers&edit_supplier=' . (int) $supplier['id'] . '">Edit</a> <form method="post" style="display:inline">' . $csrfField . '<input type="hidden" name="supplier_id" value="' . (int) $supplier['id'] . '"><button type="submit" name="toggle_supplier" class="btn ' . ($status === 'active' ? 'danger' : '') . '">' . ($status === 'active' ? 'Deactivate' : 'Reactivate') . '</button></form></td></tr>';
         }
     }
     $content .= '</tbody></table></div>';
@@ -535,7 +715,7 @@ if ($page === 'security') {
     $content .= '<div class="card"><h2>Stock Movement</h2>';
     if ($message) { $content .= '<div class="alert success">' . e($message) . '</div>'; }
     if ($error) { $content .= '<div class="alert error">' . e($error) . '</div>'; }
-    $content .= '<form method="post"><div class="grid two-col"><div class="field"><label>Product</label><select name="product_id" required><option value="">Select Product</option>';
+    $content .= '<form method="post"><input type="hidden" name="csrf_token" value="' . e(csrfToken()) . '"><div class="grid two-col"><div class="field"><label>Product</label><select name="product_id" required><option value="">Select Product</option>';
     foreach ($products as $product) {
         $content .= '<option value="' . (int) $product['id'] . '">' . e($product['name']) . ' (' . (int) $product['quantity'] . ' on hand)</option>';
     }
@@ -581,24 +761,7 @@ if ($page === 'security') {
     $content .= '</tbody></table></div>';
 }
 
+// The 2FA handlers above reuse $user for a full database row, so reset it to the minimal layout data.
 $user = ['name' => $_SESSION['user_name'], 'role' => $_SESSION['user_role']];
-
-if ($page === 'products' && $_SESSION['user_role'] !== 'Admin' && $_SESSION['user_role'] !== 'Manager') {
-    http_response_code(403);
-    echo renderLayout('Access denied', '<div class="card"><h2>Access denied</h2><p>You are not allowed to access product management.</p></div>', $page, $user);
-    exit;
-}
-
-if ($page === 'suppliers' && $_SESSION['user_role'] !== 'Admin' && $_SESSION['user_role'] !== 'Manager') {
-    http_response_code(403);
-    echo renderLayout('Access denied', '<div class="card"><h2>Access denied</h2><p>You are not allowed to access supplier management.</p></div>', $page, $user);
-    exit;
-}
-
-if ($page === 'stock' && $_SESSION['user_role'] !== 'Admin' && $_SESSION['user_role'] !== 'Manager' && $_SESSION['user_role'] !== 'Staff') {
-    http_response_code(403);
-    echo renderLayout('Access denied', '<div class="card"><h2>Access denied</h2><p>You are not allowed to post stock movements.</p></div>', $page, $user);
-    exit;
-}
 
 echo renderLayout('Inventory System', $content, $page, $user);

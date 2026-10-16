@@ -583,14 +583,12 @@ function renderNavbar(string $currentPage, array $user): string
         $nav['users'] = 'Users';
     }
 
-    $html = '<nav class="nav" aria-label="Main navigation"><a class="brand" href="index.php?page=dashboard"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span class="brand-copy"><strong>PRESSROOM</strong><small>Inventory control</small></span></a><div class="nav-links">';
+    $html = '<aside class="sidebar"><a class="brand" href="index.php?page=dashboard"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span><span class="brand-copy"><strong>Printing press</strong><small>Production stock</small></span></a><p class="sidebar-label">WORKSPACE</p><nav class="nav-links" aria-label="Main navigation">';
     foreach ($nav as $page => $label) {
         $active = $currentPage === $page ? ' active' : '';
         $html .= '<a class="nav-item' . $active . '" href="index.php?page=' . $page . '"' . ($currentPage === $page ? ' aria-current="page"' : '') . '>' . $label . '</a>';
     }
-    $html .= '</div><a class="nav-item danger" href="index.php?logout=1">Sign out</a>';
-    $html .= '<span class="user-pill">' . e($user['name']) . ' (' . e($user['role']) . ')</span>';
-    $html .= '</nav>';
+    $html .= '</nav><div class="sidebar-bottom"><div class="account-chip"><span class="account-initial">' . e(mb_strtoupper(mb_substr($user['name'] ?? '', 0, 1))) . '</span><span class="account-copy"><strong>' . e($user['name'] ?? '') . '</strong><small>' . e($user['role'] ?? '') . '</small></span></div><a class="signout-link" href="index.php?logout=1">Sign out <span aria-hidden="true">↗</span></a></div></aside>';
 
     return $html;
 }
@@ -604,20 +602,20 @@ function renderLayout(string $title, string $content, string $currentPage, array
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <title>' . e($title) . '</title>
+        <link rel="preconnect" href="https://fonts.googleapis.com">
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
         <link rel="stylesheet" href="assets/css/app.css" />
     </head>
     <body>
-        <div class="app-shell"><div class="container">
-            ' . renderNavbar($currentPage, $user) . '
-            ' . $content . '
-        </div></div>
+        <div class="app-shell">' . renderNavbar($currentPage, $user) . '<main class="workspace"><div class="workspace-bar"><span><i></i> PRINT FLOOR / STOCK CONTROL</span><time>' . e(date('D, d M Y')) . '</time></div><div class="container">' . $content . '</div></main></div>
     </body>
     </html>';
 }
 
 function renderAuthShell(string $title, string $content): string
 {
-    return '<!doctype html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>' . e($title) . ' | Pressroom</title><link rel="stylesheet" href="assets/css/app.css"></head><body class="auth-body"><main class="auth-shell"><aside class="auth-story"><a class="brand brand-light" href="index.php"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span class="brand-copy"><strong>PRESSROOM</strong><small>Inventory control</small></span></a><div class="auth-story-copy"><p class="eyebrow">PRINT SHOP / STOCK DESK</p><h1>Keep every press run moving.</h1><p>Paper, ink, plates, and finishing supplies, all accounted for.</p><div class="print-swatches" aria-hidden="true"><span></span><span></span><span></span><span></span></div></div><p class="auth-footnote">CSE1 inventory demo</p></aside><section class="auth-main"><div class="auth-panel"><p class="eyebrow">' . e($title) . '</p>' . $content . '</div></section></main></body></html>';
+    return '<!doctype html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>' . e($title) . ' | Printing press</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet"><link rel="stylesheet" href="assets/css/app.css"></head><body class="auth-body"><main class="auth-shell"><aside class="auth-story"><a class="brand brand-light" href="index.php"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span><span class="brand-copy"><strong>Printing press</strong><small>Production stock</small></span></a><div class="auth-story-copy"><p class="eyebrow">PRINT SHOP / STOCK DESK</p><h1>Keep every press run moving.</h1><p>Paper, ink, plates, and finishing supplies, all accounted for.</p><div class="print-swatches" aria-hidden="true"><span></span><span></span><span></span><span></span></div></div><p class="auth-footnote">CSE1 inventory demo</p></aside><section class="auth-main"><div class="auth-panel"><p class="eyebrow">' . e($title) . '</p>' . $content . '</div></section></main></body></html>';
 }
 
 function renderLoginPage(?string $message = null, ?string $error = null): string

@@ -800,7 +800,7 @@ if ($page === 'security') {
     $topProductsStmt->execute(['start_date' => $startDate, 'end_date' => $endDate]);
     $topProducts = $topProductsStmt->fetchAll();
 
-    $content = '<div class="card report-summary"><h2>Stock Movement Report</h2>';
+    $content = '<div class="report-summary"><h2>Stock Movement Report</h2>';
     if ($message) { $content .= '<div class="alert success">' . e($message) . '</div>'; }
     if ($error) { $content .= '<div class="alert error">' . e($error) . '</div>'; }
     $content .= '<form method="get" class="inline"><input type="hidden" name="page" value="reports"><div class="field"><label for="report-start">From</label><input id="report-start" type="date" name="start" value="' . e($startDate) . '" required></div><div class="field"><label for="report-end">To</label><input id="report-end" type="date" name="end" value="' . e($endDate) . '" required></div><button class="btn" type="submit">Apply range</button></form>';
@@ -1023,7 +1023,7 @@ if ($page === 'security') {
     $lowStock = getLowStockList($db);
     $latest = getRecentTransactions($db, 5);
 
-    $content = '<div class="card dashboard-summary"><h2>Dashboard</h2>';
+    $content = '<div class="dashboard-summary"><h2>Dashboard</h2>';
     if ($message) { $content .= '<div class="alert success">' . e($message) . '</div>'; }
     if ($error) { $content .= '<div class="alert error">' . e($error) . '</div>'; }
     $content .= '<div class="grid two-col"><div class="stat"><h3>In Stock</h3><div class="value">' . $stats['in_stock'] . '</div></div><div class="stat"><h3>Low Stock</h3><div class="value">' . $stats['low_stock'] . '</div></div><div class="stat"><h3>Out of Stock</h3><div class="value">' . $stats['out_of_stock'] . '</div></div><div class="stat"><h3>Total Active Products</h3><div class="value">' . $stats['total'] . '</div></div></div></div>';
@@ -1052,4 +1052,4 @@ if ($page === 'security') {
 // The 2FA handlers above reuse $user for a full database row, so reset it to the minimal layout data.
 $user = ['name' => $_SESSION['user_name'], 'role' => $_SESSION['user_role']];
 
-echo renderLayout('Inventory System', $content, $page, $user);
+echo renderLayout('Printing press', $content, $page, $user);

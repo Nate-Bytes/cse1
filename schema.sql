@@ -53,6 +53,20 @@ CREATE TABLE TRANSACTION_HISTORY (
     CONSTRAINT fk_history_user FOREIGN KEY (user_id) REFERENCES USERS(id)
 );
 
+CREATE TABLE AUDIT_LOG (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    actor_user_id INT DEFAULT NULL,
+    action VARCHAR(50) NOT NULL,
+    entity_type VARCHAR(50) NOT NULL,
+    entity_id BIGINT DEFAULT NULL,
+    summary VARCHAR(255) NOT NULL,
+    details TEXT DEFAULT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_audit_created (created_at),
+    INDEX idx_audit_entity (entity_type, entity_id),
+    CONSTRAINT fk_audit_actor FOREIGN KEY (actor_user_id) REFERENCES USERS(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 INSERT INTO USERS (name, email, password_hash, role, is_active)
 VALUES
 ('Printworks Admin', 'admin@demo.com', '$2y$10$49N9VstxKBBsjZ79e3rS9OWjXFNseFa8QXXHMk7gSjSlRe0zPKpOS', 'Admin', 1),

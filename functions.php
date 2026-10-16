@@ -17,8 +17,28 @@ function getDb(): PDO
     ]);
 
     ensureTotpSchema($pdo);
+    ensureAuditSchema($pdo);
 
     return $pdo;
+}
+
+function ensureAuditSchema(PDO $db): void
+{
+    $db->exec(
+        'CREATE TABLE IF NOT EXISTS AUDIT_LOG (' .
+        'id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, ' .
+        'actor_user_id INT DEFAULT NULL, ' .
+        'action VARCHAR(50) NOT NULL, ' .
+        'entity_type VARCHAR(50) NOT NULL, ' .
+        'entity_id BIGINT DEFAULT NULL, ' .
+        'summary VARCHAR(255) NOT NULL, ' .
+        'details TEXT DEFAULT NULL, ' .
+        'created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, ' .
+        'INDEX idx_audit_created (created_at), ' .
+        'INDEX idx_audit_entity (entity_type, entity_id), ' .
+        'CONSTRAINT fk_audit_actor FOREIGN KEY (actor_user_id) REFERENCES USERS(id) ON DELETE SET NULL' .
+        ') ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
+    );
 }
 
 function ensureTotpSchema(PDO $db): void
@@ -317,6 +337,230 @@ function getRecentTransactions(PDO $db, int $limit = 8): array
     return $stmt->fetchAll();
 }
 
+function writeAudit(PDO $db, string $action, string $entityType, ?int $entityId, string $summary, array $details = []): void
+{
+    $stmt = $db->prepare(
+        'INSERT INTO AUDIT_LOG (actor_user_id, action, entity_type, entity_id, summary, details) ' .
+        'VALUES (:actor_user_id, :action, :entity_type, :entity_id, :summary, :details)'
+    );
+    $stmt->execute([
+        'actor_user_id' => $_SESSION['user_id'] ?? null,
+        'action' => $action,
+        'entity_type' => $entityType,
+        'entity_id' => $entityId,
+        'summary' => mb_substr($summary, 0, 255),
+        'details' => $details === [] ? null : json_encode($details, JSON_THROW_ON_ERROR),
+    ]);
+}
+
+function getStockMovementReport(PDO $db, string $startDate, string $endDate): array
+{
+    $stmt = $db->prepare(
+        'SELECT DATE_FORMAT(created_at, \'%Y-%m\') AS month, type, SUM(quantity) AS total_quantity, COUNT(*) AS movement_count ' .
+        'FROM TRANSACTION_HISTORY WHERE created_at >= :start_date AND created_at < DATE_ADD(:end_date, INTERVAL 1 DAY) ' .
+        'GROUP BY DATE_FORMAT(created_at, \'%Y-%m\'), type ORDER BY month ASC'
+    );
+    $stmt->execute(['start_date' => $startDate, 'end_date' => $endDate]);
+    return $stmt->fetchAll();
+}
+
+function getAuditEntries(PDO $db, int $limit = 100): array
+{
+    $stmt = $db->prepare(
+        'SELECT a.*, u.name AS actor_name FROM AUDIT_LOG a ' .
+        'LEFT JOIN USERS u ON u.id = a.actor_user_id ' .
+        'ORDER BY a.created_at DESC, a.id DESC LIMIT :limit'
+    );
+    $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+    $stmt->execute();
+    return $stmt->fetchAll();
+}
+
+function exportCatalogCsv(PDO $db, string $kind): never
+{
+    $kind = $kind === 'suppliers' ? 'suppliers' : 'products';
+    writeAudit($db, 'export', $kind, null, 'Exported active ' . $kind);
+    $filename = $kind . '-' . date('Y-m-d') . '.csv';
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="' . $filename . '"');
+    $output = fopen('php://output', 'wb');
+
+    if ($kind === 'products') {
+        writeCatalogCsvRow($output, ['sku', 'name', 'supplier', 'reorder_level', 'opening_quantity']);
+        $rows = $db->query(
+            'SELECT p.sku, p.name, s.name AS supplier, p.reorder_level, p.quantity AS opening_quantity ' .
+            'FROM PRODUCTS p JOIN SUPPLIERS s ON s.id = p.supplier_id ' .
+            'WHERE p.is_active = 1 ORDER BY p.name'
+        );
+    } else {
+        writeCatalogCsvRow($output, ['name', 'contact_person', 'phone', 'email']);
+        $rows = $db->query('SELECT name, contact_person, phone, email FROM SUPPLIERS WHERE is_active = 1 ORDER BY name');
+    }
+
+    while ($row = $rows->fetch(PDO::FETCH_NUM)) {
+        writeCatalogCsvRow($output, $row);
+    }
+
+    fclose($output);
+    exit;
+}
+
+function writeCatalogCsvRow($output, array $row): void
+{
+    $safeRow = array_map(static function ($value) {
+        if (is_string($value) && preg_match('/^[=+\-@\t\r]/', $value)) {
+            return "'" . $value;
+        }
+        return $value;
+    }, $row);
+    fputcsv($output, $safeRow);
+}
+
+function importCatalogCsv(PDO $db, string $kind, string $filePath, int $actorId): array
+{
+    if (!is_file($filePath) || filesize($filePath) > 2_000_000) {
+        throw new RuntimeException('Choose a CSV file smaller than 2 MB.');
+    }
+
+    $input = fopen($filePath, 'rb');
+    if ($input === false) {
+        throw new RuntimeException('The uploaded CSV could not be opened.');
+    }
+
+    $expected = $kind === 'products'
+        ? ['sku', 'name', 'supplier', 'reorder_level', 'opening_quantity']
+        : ['name', 'contact_person', 'phone', 'email'];
+    $header = fgetcsv($input);
+    if (!is_array($header)) {
+        fclose($input);
+        throw new RuntimeException('The CSV file is empty.');
+    }
+    if (isset($header[0])) {
+        $header[0] = preg_replace('/^\xEF\xBB\xBF/', '', (string) $header[0]);
+    }
+    $header = array_map(static fn ($value): string => strtolower(trim((string) $value)), $header);
+    if ($header !== $expected) {
+        fclose($input);
+        throw new RuntimeException('CSV columns must be: ' . implode(', ', $expected) . '.');
+    }
+
+    $db->beginTransaction();
+    $created = 0;
+    $updated = 0;
+    $rowNumber = 1;
+
+    try {
+        while (($values = fgetcsv($input)) !== false) {
+            $rowNumber++;
+            if ($values === [null] || $values === []) {
+                continue;
+            }
+            if ($rowNumber > 1001) {
+                throw new RuntimeException('CSV imports are limited to 1,000 data rows.');
+            }
+            if (count($values) !== count($expected)) {
+                throw new RuntimeException('Row ' . $rowNumber . ' has the wrong number of columns.');
+            }
+
+            $row = array_combine($expected, array_map(static fn ($value): string => trim((string) $value), $values));
+            if ($kind === 'suppliers') {
+                if ($row['name'] === '' || mb_strlen($row['name']) > 150 || mb_strlen($row['contact_person']) > 100 || mb_strlen($row['phone']) > 30 || mb_strlen($row['email']) > 100) {
+                    throw new RuntimeException('Row ' . $rowNumber . ' has a missing or oversized supplier field.');
+                }
+                if ($row['email'] !== '' && !filter_var($row['email'], FILTER_VALIDATE_EMAIL)) {
+                    throw new RuntimeException('Row ' . $rowNumber . ' has an invalid supplier email.');
+                }
+
+                $find = $db->prepare('SELECT id FROM SUPPLIERS WHERE name = :name ORDER BY id LIMIT 1 FOR UPDATE');
+                $find->execute(['name' => $row['name']]);
+                $supplierId = $find->fetchColumn();
+                if ($supplierId !== false) {
+                    $save = $db->prepare('UPDATE SUPPLIERS SET contact_person = :contact, phone = :phone, email = :email WHERE id = :id');
+                    $save->execute([
+                        'contact' => $row['contact_person'] !== '' ? $row['contact_person'] : null,
+                        'phone' => $row['phone'] !== '' ? $row['phone'] : null,
+                        'email' => $row['email'] !== '' ? $row['email'] : null,
+                        'id' => $supplierId,
+                    ]);
+                    $updated++;
+                } else {
+                    $save = $db->prepare('INSERT INTO SUPPLIERS (name, contact_person, phone, email) VALUES (:name, :contact, :phone, :email)');
+                    $save->execute([
+                        'name' => $row['name'],
+                        'contact' => $row['contact_person'] !== '' ? $row['contact_person'] : null,
+                        'phone' => $row['phone'] !== '' ? $row['phone'] : null,
+                        'email' => $row['email'] !== '' ? $row['email'] : null,
+                    ]);
+                    $created++;
+                }
+                continue;
+            }
+
+            if ($row['sku'] === '' || mb_strlen($row['sku']) > 100 || $row['name'] === '' || mb_strlen($row['name']) > 150 || $row['supplier'] === '') {
+                throw new RuntimeException('Row ' . $rowNumber . ' has a missing or oversized product field.');
+            }
+            $reorderLevel = filter_var($row['reorder_level'], FILTER_VALIDATE_INT);
+            $openingQuantity = filter_var($row['opening_quantity'], FILTER_VALIDATE_INT);
+            if ($reorderLevel === false || $reorderLevel < 0 || $openingQuantity === false || $openingQuantity < 0) {
+                throw new RuntimeException('Row ' . $rowNumber . ' must have nonnegative whole-number stock values.');
+            }
+
+            $findSupplier = $db->prepare('SELECT id FROM SUPPLIERS WHERE name = :name AND is_active = 1 LIMIT 1');
+            $findSupplier->execute(['name' => $row['supplier']]);
+            $supplierId = $findSupplier->fetchColumn();
+            if ($supplierId === false) {
+                throw new RuntimeException('Row ' . $rowNumber . ' references an unknown or inactive supplier.');
+            }
+
+            $findProduct = $db->prepare('SELECT id, is_active FROM PRODUCTS WHERE sku = :sku FOR UPDATE');
+            $findProduct->execute(['sku' => $row['sku']]);
+            $product = $findProduct->fetch();
+            if ($product && (int) $product['is_active'] !== 1) {
+                throw new RuntimeException('Row ' . $rowNumber . ' uses archived SKU ' . $row['sku'] . '. Reactivate it before importing.');
+            }
+
+            if ($product) {
+                $save = $db->prepare('UPDATE PRODUCTS SET supplier_id = :supplier_id, name = :name, reorder_level = :reorder_level WHERE id = :id');
+                $save->execute(['supplier_id' => $supplierId, 'name' => $row['name'], 'reorder_level' => $reorderLevel, 'id' => $product['id']]);
+                $updated++;
+            } else {
+                $save = $db->prepare('INSERT INTO PRODUCTS (supplier_id, name, sku, quantity, reorder_level, is_active) VALUES (:supplier_id, :name, :sku, :quantity, :reorder_level, 1)');
+                $save->execute([
+                    'supplier_id' => $supplierId,
+                    'name' => $row['name'],
+                    'sku' => $row['sku'],
+                    'quantity' => $openingQuantity,
+                    'reorder_level' => $reorderLevel,
+                ]);
+                $productId = (int) $db->lastInsertId();
+                if ($openingQuantity > 0) {
+                    $opening = $db->prepare(
+                        'INSERT INTO TRANSACTION_HISTORY (product_id, type, quantity, before_quantity, after_quantity, notes, user_id) ' .
+                        'VALUES (:product_id, \'IN\', :quantity, 0, :quantity, \'CSV opening balance\', :user_id)'
+                    );
+                    $opening->execute(['product_id' => $productId, 'quantity' => $openingQuantity, 'user_id' => $actorId]);
+                }
+                $created++;
+            }
+        }
+
+        if ($created + $updated === 0) {
+            throw new RuntimeException('The CSV contains no data rows.');
+        }
+        writeAudit($db, 'import', $kind, null, 'Imported ' . ($created + $updated) . ' ' . $kind, ['created' => $created, 'updated' => $updated]);
+        $db->commit();
+    } catch (Throwable $ex) {
+        if ($db->inTransaction()) {
+            $db->rollBack();
+        }
+        fclose($input);
+        throw $ex;
+    }
+
+    fclose($input);
+    return ['created' => $created, 'updated' => $updated];
+}
+
 function renderNavbar(string $currentPage, array $user): string
 {
     $nav = [
@@ -327,17 +571,24 @@ function renderNavbar(string $currentPage, array $user): string
         'security' => 'Security',
     ];
 
-    // Staff have a read-only product catalog and no supplier management.
-    if (!in_array($user['role'] ?? '', ['Admin', 'Manager'], true)) {
+    $role = $user['role'] ?? '';
+    if (!in_array($role, ['Admin', 'Manager'], true)) {
         unset($nav['suppliers']);
     }
+    if (in_array($role, ['Admin', 'Manager'], true)) {
+        $nav['reports'] = 'Reports';
+    }
+    if ($role === 'Admin') {
+        $nav['audit'] = 'Audit Log';
+        $nav['users'] = 'Users';
+    }
 
-    $html = '<nav class="nav">';
+    $html = '<nav class="nav" aria-label="Main navigation"><a class="brand" href="index.php?page=dashboard"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span class="brand-copy"><strong>PRESSROOM</strong><small>Inventory control</small></span></a><div class="nav-links">';
     foreach ($nav as $page => $label) {
         $active = $currentPage === $page ? ' active' : '';
-        $html .= '<a class="nav-item' . $active . '" href="index.php?page=' . $page . '">' . $label . '</a>';
+        $html .= '<a class="nav-item' . $active . '" href="index.php?page=' . $page . '"' . ($currentPage === $page ? ' aria-current="page"' : '') . '>' . $label . '</a>';
     }
-    $html .= '<a class="nav-item danger" href="index.php?logout=1">Logout</a>';
+    $html .= '</div><a class="nav-item danger" href="index.php?logout=1">Sign out</a>';
     $html .= '<span class="user-pill">' . e($user['name']) . ' (' . e($user['role']) . ')</span>';
     $html .= '</nav>';
 
@@ -353,58 +604,25 @@ function renderLayout(string $title, string $content, string $currentPage, array
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <title>' . e($title) . '</title>
-        <style>
-            * { box-sizing: border-box; }
-            body { font-family: Arial, sans-serif; background: #f3f4f6; margin: 0; color: #1f2937; }
-            .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
-            .nav { display: flex; flex-wrap: wrap; gap: 10px; padding: 14px 18px; background: #111827; color: white; border-radius: 12px; margin-bottom: 20px; }
-            .nav-item { color: white; text-decoration: none; padding: 8px 12px; border-radius: 8px; }
-            .nav-item.active { background: #2563eb; }
-            .nav-item.danger { background: #b91c1c; }
-            .user-pill { margin-left: auto; align-self: center; background: rgba(255,255,255,0.12); border-radius: 999px; padding: 8px 12px; font-size: 12px; }
-            .card { background: white; border-radius: 12px; box-shadow: 0 1px 5px rgba(0,0,0,0.08); padding: 18px; margin-bottom: 20px; }
-            .grid { display: grid; gap: 18px; }
-            .two-col { grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); }
-            .stat { background: #eff6ff; border-left: 5px solid #2563eb; padding: 16px; border-radius: 8px; }
-            .stat h3 { margin: 0 0 8px; font-size: 14px; color: #374151; }
-            .stat .value { font-size: 28px; font-weight: bold; }
-            .notice { background: #fff7ed; border: 1px solid #fdba74; color: #9a4d00; padding: 12px 14px; border-radius: 8px; margin-bottom: 20px; }
-            table { width: 100%; border-collapse: collapse; }
-            th, td { border-bottom: 1px solid #e5e7eb; padding: 10px 8px; text-align: left; font-size: 14px; }
-            th { background: #f9fafb; }
-            .btn { display: inline-block; text-decoration: none; border: none; padding: 10px 14px; border-radius: 8px; cursor: pointer; background: #2563eb; color: white; }
-            .btn.secondary { background: #4b5563; }
-            .btn.warning { background: #d97706; }
-            .btn.danger { background: #dc2626; }
-            form { display: grid; gap: 12px; }
-            .field { display: grid; gap: 6px; }
-            .field input, .field select, .field textarea { width: 100%; padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 8px; }
-            .inline { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
-            .alert { padding: 12px 14px; border-radius: 8px; margin-bottom: 16px; }
-            .alert.success { background: #ecfdf5; color: #065f46; }
-            .alert.error { background: #fef2f2; color: #991b1b; }
-            .muted { color: #6b7280; }
-            .status-badge { display: inline-block; padding: 4px 8px; border-radius: 999px; font-size: 12px; font-weight: bold; }
-            .status-active { background: #dcfce7; color: #166534; }
-            .status-inactive { background: #f3f4f6; color: #374151; }
-            .qr-code { width: fit-content; max-width: 100%; margin: 16px 0; padding: 12px; background: white; border: 1px solid #e5e7eb; border-radius: 8px; }
-            .qr-code svg { display: block; width: min(100%, 320px); height: auto; }
-            @media (max-width: 700px) { .user-pill { margin-left: 0; } }
-        </style>
+        <link rel="stylesheet" href="assets/css/app.css" />
     </head>
     <body>
-        <div class="container">
+        <div class="app-shell"><div class="container">
             ' . renderNavbar($currentPage, $user) . '
             ' . $content . '
-        </div>
+        </div></div>
     </body>
     </html>';
 }
 
+function renderAuthShell(string $title, string $content): string
+{
+    return '<!doctype html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>' . e($title) . ' | Pressroom</title><link rel="stylesheet" href="assets/css/app.css"></head><body class="auth-body"><main class="auth-shell"><aside class="auth-story"><a class="brand brand-light" href="index.php"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span class="brand-copy"><strong>PRESSROOM</strong><small>Inventory control</small></span></a><div class="auth-story-copy"><p class="eyebrow">PRINT SHOP / STOCK DESK</p><h1>Keep every press run moving.</h1><p>Paper, ink, plates, and finishing supplies, all accounted for.</p><div class="print-swatches" aria-hidden="true"><span></span><span></span><span></span><span></span></div></div><p class="auth-footnote">CSE1 inventory demo</p></aside><section class="auth-main"><div class="auth-panel"><p class="eyebrow">' . e($title) . '</p>' . $content . '</div></section></main></body></html>';
+}
+
 function renderLoginPage(?string $message = null, ?string $error = null): string
 {
-    $html = '<div class="card" style="max-width: 420px; margin: 60px auto;">
-        <h2>Inventory Login</h2>';
+    $html = '<h2>Welcome back.</h2><p class="auth-subtitle">Sign in to the stock desk.</p>';
 
     if ($error) {
         $html .= '<div class="alert error">' . e($error) . '</div>';
@@ -415,41 +633,38 @@ function renderLoginPage(?string $message = null, ?string $error = null): string
     }
 
     $html .= '
-        <form method="post">
+        <form method="post" class="auth-form">
             <input type="hidden" name="csrf_token" value="' . e(csrfToken()) . '" />
             <div class="field">
-                <label>Email</label>
-                <input type="email" name="email" required placeholder="admin@demo.com" />
+                <label for="login-email">Email</label>
+                <input id="login-email" type="email" name="email" required placeholder="admin@demo.com" autocomplete="username" />
             </div>
             <div class="field">
-                <label>Password</label>
-                <input type="password" name="password" required placeholder="Enter password" />
+                <label for="login-password">Password</label>
+                <input id="login-password" type="password" name="password" required placeholder="Enter password" autocomplete="current-password" />
             </div>
             <button type="submit" name="login" class="btn">Login</button>
         </form>
-        <p class="muted">Demo accounts: admin@demo.com / admin123, manager@demo.com / manager123, staff@demo.com / staff123</p>
-    </div>';
+        <details class="demo-accounts"><summary>Demo accounts</summary><p>Admin: admin@demo.com / admin123<br>Manager: manager@demo.com / manager123<br>Staff: staff@demo.com / staff123</p></details>';
 
-    return $html;
+    return renderAuthShell('Sign in', $html);
 }
 
 function renderTotpLoginPage(?string $error = null): string
 {
-    $html = '<div class="card" style="max-width: 420px; margin: 60px auto;">
-        <h2>Two-factor verification</h2>
-        <p>Enter the six-digit code from your authenticator app.</p>';
+    $html = '<h2>Verify it’s you.</h2><p class="auth-subtitle">Enter the six-digit code from your authenticator app.</p>';
 
     if ($error) {
         $html .= '<div class="alert error">' . e($error) . '</div>';
     }
 
-    $html .= '<form method="post">
+    $html .= '<form method="post" class="auth-form">
         <input type="hidden" name="csrf_token" value="' . e(csrfToken()) . '" />
         <div class="field"><label for="totp_code">Authenticator code</label>
         <input id="totp_code" type="text" name="totp_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required autofocus></div>
-        <button type="submit" name="verify_2fa" class="btn">Verify</button>
-        <a href="index.php?cancel_2fa=1" class="btn secondary">Cancel</a>
-    </form></div>';
+        <div class="inline"><button type="submit" name="verify_2fa" class="btn">Verify code</button>
+        <a href="index.php?cancel_2fa=1" class="btn secondary">Cancel</a></div>
+    </form>';
 
-    return $html;
+    return renderAuthShell('Two-factor verification', $html);
 }

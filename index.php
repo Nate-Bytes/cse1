@@ -129,9 +129,18 @@ if (!isLoggedIn()) {
 
 requireLogin();
 
+$authenticatedUser = getUserById($db, (int) $_SESSION['user_id']);
+if (!$authenticatedUser || (int) $authenticatedUser['is_active'] !== 1) {
+    logoutUser();
+}
+$_SESSION['user_name'] = $authenticatedUser['name'];
+$_SESSION['user_role'] = $authenticatedUser['role'];
+
 $role = (string) $_SESSION['user_role'];
 $user = ['name' => $_SESSION['user_name'], 'role' => $role];
 $canManageCatalog = in_array($role, ['Admin', 'Manager'], true);
+$canManageUsers = $role === 'Admin';
+$canViewReports = in_array($role, ['Admin', 'Manager'], true);
 
 function denyAccess(string $text, string $page, array $user): void
 {
@@ -141,12 +150,29 @@ function denyAccess(string $text, string $page, array $user): void
 }
 
 // Access control runs BEFORE any handler, so a forbidden request never changes data.
+$pageRoles = [
+    'dashboard' => ['Admin', 'Manager', 'Staff'],
+    'products' => ['Admin', 'Manager', 'Staff'],
+    'suppliers' => ['Admin', 'Manager'],
+    'stock' => ['Admin', 'Manager', 'Staff'],
+    'security' => ['Admin', 'Manager', 'Staff'],
+    'reports' => ['Admin', 'Manager'],
+    'audit' => ['Admin'],
+    'users' => ['Admin'],
+];
+if (!isset($pageRoles[$page])) {
+    http_response_code(404);
+    $page = 'dashboard';
+    denyAccess('The requested page was not found.', $page, $user);
+}
+if (!in_array($role, $pageRoles[$page], true)) {
+    denyAccess('Your role does not have access to this page.', $page, $user);
+}
+
 $catalogActions = ['save_product', 'toggle_product', 'save_supplier', 'toggle_supplier'];
 $inventoryActions = array_merge($catalogActions, ['post_stock']);
-
-if ($page === 'suppliers' && !$canManageCatalog) {
-    denyAccess('You are not allowed to access supplier management.', $page, $user);
-}
+$userActions = ['save_user', 'toggle_user'];
+$importActions = ['import_products', 'import_suppliers'];
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     foreach ($catalogActions as $action) {
@@ -159,14 +185,152 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         denyAccess('You are not allowed to post stock movements.', $page, $user);
     }
 
-    // CSRF check for every inventory write; a bad token cancels the action.
-    foreach ($inventoryActions as $action) {
+    foreach (array_merge($userActions, $importActions) as $action) {
+        if (isset($_POST[$action]) && ($action === 'save_user' || $action === 'toggle_user' ? !$canManageUsers : !$canManageCatalog)) {
+            denyAccess('Your role is not permitted to perform this action.', $page, $user);
+        }
+    }
+
+    // CSRF check for every state-changing form; a bad token cancels the action.
+    foreach (array_merge($inventoryActions, $userActions, $importActions) as $action) {
         if (isset($_POST[$action]) && !hasValidCsrfToken()) {
-            foreach ($inventoryActions as $cancelled) {
+            foreach (array_merge($inventoryActions, $userActions, $importActions) as $cancelled) {
                 unset($_POST[$cancelled]);
             }
             $error = 'Your session expired. Reload the page and try again.';
             break;
+        }
+    }
+}
+
+if (isset($_GET['export'])) {
+    if (!$canManageCatalog || !in_array($_GET['export'], ['products', 'suppliers'], true)) {
+        denyAccess('Only Admin and Manager roles can export the catalog.', $page, $user);
+    }
+    exportCatalogCsv($db, $_GET['export']);
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && (isset($_POST['import_products']) || isset($_POST['import_suppliers']))) {
+    $kind = isset($_POST['import_products']) ? 'products' : 'suppliers';
+    if (!hasValidCsrfToken()) {
+        $error = 'Your session expired. Reload the page and try again.';
+    } elseif (!isset($_FILES['csv_file']) || $_FILES['csv_file']['error'] !== UPLOAD_ERR_OK) {
+        $error = 'Choose a valid CSV file to import.';
+    } else {
+        try {
+            $result = importCatalogCsv($db, $kind, $_FILES['csv_file']['tmp_name'], (int) $_SESSION['user_id']);
+            $message = 'Import complete: ' . $result['created'] . ' added, ' . $result['updated'] . ' updated.';
+        } catch (Throwable $ex) {
+            $error = $ex->getMessage();
+        }
+    }
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_user'])) {
+    $id = filter_var($_POST['id'] ?? '', FILTER_VALIDATE_INT);
+    $id = $id && $id > 0 ? $id : null;
+    $name = trim((string) ($_POST['name'] ?? ''));
+    $email = strtolower(trim((string) ($_POST['email'] ?? '')));
+    $newRole = (string) ($_POST['role'] ?? '');
+    $password = (string) ($_POST['password'] ?? '');
+    $active = isset($_POST['is_active']) ? 1 : 0;
+    $existing = null;
+
+    if ($id) {
+        $stmt = $db->prepare('SELECT id, role, is_active FROM USERS WHERE id = :id');
+        $stmt->execute(['id' => $id]);
+        $existing = $stmt->fetch() ?: null;
+    }
+
+    if ($name === '' || mb_strlen($name) > 100 || !filter_var($email, FILTER_VALIDATE_EMAIL) || mb_strlen($email) > 100 || !in_array($newRole, ['Admin', 'Manager', 'Staff'], true)) {
+        $error = 'Enter a valid name, email, and role.';
+    } elseif (!$id && strlen($password) < 8) {
+        $error = 'New user passwords must contain at least 8 characters.';
+    } elseif ($password !== '' && strlen($password) < 8) {
+        $error = 'Passwords must contain at least 8 characters.';
+    } elseif ($id && !$existing) {
+        $error = 'User not found.';
+    } elseif ($id === (int) $_SESSION['user_id'] && ($newRole !== 'Admin' || $active !== 1)) {
+        $error = 'You cannot change your own Admin role or deactivate your own account.';
+    } else {
+        try {
+            $db->beginTransaction();
+            if ($existing && $existing['role'] === 'Admin' && (int) $existing['is_active'] === 1 && ($newRole !== 'Admin' || $active !== 1)) {
+                $activeAdmins = $db->query("SELECT id FROM USERS WHERE role = 'Admin' AND is_active = 1 ORDER BY id FOR UPDATE")->fetchAll();
+                if (count($activeAdmins) <= 1) {
+                    throw new RuntimeException('At least one active Admin account must remain.');
+                }
+            }
+
+            if ($id) {
+                $sql = 'UPDATE USERS SET name = :name, email = :email, role = :role, is_active = :is_active';
+                if ($password !== '') {
+                    $sql .= ', password_hash = :password_hash';
+                }
+                $sql .= ' WHERE id = :id';
+                $params = ['name' => $name, 'email' => $email, 'role' => $newRole, 'is_active' => $active, 'id' => $id];
+                if ($password !== '') {
+                    $params['password_hash'] = password_hash($password, PASSWORD_DEFAULT);
+                }
+                $stmt = $db->prepare($sql);
+                $stmt->execute($params);
+                writeAudit($db, 'update', 'user', $id, 'Updated user ' . $email, ['role' => $newRole, 'is_active' => $active]);
+                $message = 'User updated.';
+            } else {
+                $stmt = $db->prepare('INSERT INTO USERS (name, email, password_hash, role, is_active) VALUES (:name, :email, :password_hash, :role, :is_active)');
+                $stmt->execute([
+                    'name' => $name,
+                    'email' => $email,
+                    'password_hash' => password_hash($password, PASSWORD_DEFAULT),
+                    'role' => $newRole,
+                    'is_active' => $active,
+                ]);
+                $newId = (int) $db->lastInsertId();
+                writeAudit($db, 'create', 'user', $newId, 'Created user ' . $email, ['role' => $newRole]);
+                $message = 'User created.';
+            }
+            $db->commit();
+        } catch (PDOException $ex) {
+            if ($db->inTransaction()) { $db->rollBack(); }
+            $error = (int) ($ex->errorInfo[1] ?? 0) === 1062 ? 'That email address is already in use.' : 'The user could not be saved.';
+        } catch (Throwable $ex) {
+            if ($db->inTransaction()) { $db->rollBack(); }
+            $error = $ex->getMessage();
+        }
+    }
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['toggle_user'])) {
+    $id = filter_var($_POST['user_id'] ?? '', FILTER_VALIDATE_INT);
+    $id = $id && $id > 0 ? $id : 0;
+    if ($id === (int) $_SESSION['user_id']) {
+        $error = 'You cannot deactivate your own account.';
+    } elseif ($id === 0) {
+        $error = 'User not found.';
+    } else {
+        try {
+            $db->beginTransaction();
+            $stmt = $db->prepare('SELECT id, email, role, is_active FROM USERS WHERE id = :id FOR UPDATE');
+            $stmt->execute(['id' => $id]);
+            $target = $stmt->fetch();
+            if (!$target) {
+                throw new RuntimeException('User not found.');
+            }
+            $nextActive = (int) $target['is_active'] === 1 ? 0 : 1;
+            if ($target['role'] === 'Admin' && $nextActive === 0) {
+                $activeAdmins = $db->query("SELECT id FROM USERS WHERE role = 'Admin' AND is_active = 1 ORDER BY id FOR UPDATE")->fetchAll();
+                if (count($activeAdmins) <= 1) {
+                    throw new RuntimeException('At least one active Admin account must remain.');
+                }
+            }
+            $update = $db->prepare('UPDATE USERS SET is_active = :active WHERE id = :id');
+            $update->execute(['active' => $nextActive, 'id' => $id]);
+            writeAudit($db, $nextActive ? 'restore' : 'deactivate', 'user', $id, ($nextActive ? 'Reactivated ' : 'Deactivated ') . $target['email']);
+            $db->commit();
+            $message = $nextActive ? 'User reactivated.' : 'User deactivated.';
+        } catch (Throwable $ex) {
+            if ($db->inTransaction()) { $db->rollBack(); }
+            $error = $ex->getMessage();
         }
     }
 }
@@ -313,6 +477,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_product'])) {
     } else {
         try {
             if ($id) {
+                $db->beginTransaction();
                 $stmt = $db->prepare('UPDATE PRODUCTS SET supplier_id = :supplier_id, name = :name, sku = :sku, reorder_level = :reorder_level WHERE id = :id');
                 $stmt->execute([
                     'supplier_id' => $supplierId,
@@ -321,6 +486,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_product'])) {
                     'reorder_level' => $reorderLevel,
                     'id' => $id,
                 ]);
+                writeAudit($db, 'update', 'product', $id, 'Updated product ' . $sku, ['supplier_id' => $supplierId]);
+                $db->commit();
                 $message = 'Product updated.';
             } else {
                 $db->beginTransaction();
@@ -348,6 +515,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_product'])) {
                         'user_id' => $_SESSION['user_id'],
                     ]);
                 }
+                writeAudit($db, 'create', 'product', $newProductId, 'Created product ' . $sku, ['opening_quantity' => $quantity]);
                 $db->commit();
                 $message = 'Product added.';
             }
@@ -358,6 +526,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_product'])) {
             $error = (int) ($ex->errorInfo[1] ?? 0) === 1062
                 ? 'That SKU already exists. Use a different SKU.'
                 : 'The product could not be saved. Please try again.';
+        } catch (Throwable $ex) {
+            if ($db->inTransaction()) {
+                $db->rollBack();
+            }
+            $error = 'The product could not be saved. Please try again.';
         }
     }
 }
@@ -374,8 +547,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['toggle_product'])) {
         } elseif ((int) $row['is_active'] === 0 && (int) $row['supplier_active'] !== 1) {
             $error = 'Reactivate this product\'s supplier first, or edit the product to use an active supplier.';
         } else {
+            $db->beginTransaction();
             $stmt = $db->prepare('UPDATE PRODUCTS SET is_active = 1 - is_active WHERE id = :id');
             $stmt->execute(['id' => $id]);
+            $nextActive = (int) $row['is_active'] === 1 ? 0 : 1;
+            writeAudit($db, $nextActive ? 'restore' : 'deactivate', 'product', $id, ($nextActive ? 'Reactivated product ' : 'Deactivated product ') . $id);
+            $db->commit();
             $message = (int) $row['is_active'] === 1 ? 'Product deactivated.' : 'Product reactivated.';
         }
     }
@@ -403,16 +580,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_supplier'])) {
         ];
         try {
             if ($id) {
+                $db->beginTransaction();
                 $stmt = $db->prepare('UPDATE SUPPLIERS SET name = :name, contact_person = :contact_person, phone = :phone, email = :email WHERE id = :id');
                 $params['id'] = $id;
                 $stmt->execute($params);
+                writeAudit($db, 'update', 'supplier', $id, 'Updated supplier ' . $name);
+                $db->commit();
                 $message = 'Supplier updated.';
             } else {
+                $db->beginTransaction();
                 $stmt = $db->prepare('INSERT INTO SUPPLIERS (name, contact_person, phone, email, is_active, created_at) VALUES (:name, :contact_person, :phone, :email, 1, NOW())');
                 $stmt->execute($params);
+                writeAudit($db, 'create', 'supplier', (int) $db->lastInsertId(), 'Created supplier ' . $name);
+                $db->commit();
                 $message = 'Supplier added.';
             }
         } catch (PDOException $ex) {
+            if ($db->inTransaction()) { $db->rollBack(); }
+            $error = 'The supplier could not be saved. Please try again.';
+        } catch (Throwable $ex) {
+            if ($db->inTransaction()) { $db->rollBack(); }
             $error = 'The supplier could not be saved. Please try again.';
         }
     }
@@ -440,8 +627,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['toggle_supplier'])) {
             }
 
             if (!$blocked) {
+                $db->beginTransaction();
                 $stmt = $db->prepare('UPDATE SUPPLIERS SET is_active = 1 - is_active WHERE id = :id');
                 $stmt->execute(['id' => $id]);
+                $nextActive = (int) $row['is_active'] === 1 ? 0 : 1;
+                writeAudit($db, $nextActive ? 'restore' : 'deactivate', 'supplier', $id, ($nextActive ? 'Reactivated supplier ' : 'Deactivated supplier ') . $id);
+                $db->commit();
                 $message = (int) $row['is_active'] === 1 ? 'Supplier deactivated.' : 'Supplier reactivated.';
             }
         }
@@ -498,6 +689,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['post_stock'])) {
                 'user_id' => $_SESSION['user_id'],
             ]);
 
+            writeAudit($db, 'stock_' . strtolower($type), 'product', $productId, 'Posted ' . $type . ' movement for product ' . $productId, [
+                'quantity' => $quantity,
+                'before_quantity' => $before,
+                'after_quantity' => $after,
+            ]);
             $db->commit();
             $message = 'Stock movement recorded successfully.';
         } catch (RuntimeException $ex) {
@@ -572,6 +768,98 @@ if ($page === 'security') {
         </form>';
     }
     $content .= '</div>';
+} elseif ($page === 'reports') {
+    $startDate = $_GET['start'] ?? date('Y-m-01', strtotime('-5 months'));
+    $endDate = $_GET['end'] ?? date('Y-m-d');
+    $validDate = static fn ($value): bool => is_string($value) && preg_match('/^\d{4}-\d{2}-\d{2}$/', $value) && strtotime($value) !== false && date('Y-m-d', strtotime($value)) === $value;
+    if (!$validDate($startDate) || !$validDate($endDate) || $startDate > $endDate) {
+        $startDate = date('Y-m-01', strtotime('-5 months'));
+        $endDate = date('Y-m-d');
+        $error = 'Choose a valid date range.';
+    }
+    $movementRows = getStockMovementReport($db, $startDate, $endDate);
+    $byMonth = [];
+    $totalIn = 0;
+    $totalOut = 0;
+    foreach ($movementRows as $row) {
+        $month = $row['month'];
+        $byMonth[$month] ??= ['IN' => 0, 'OUT' => 0, 'count' => 0];
+        $byMonth[$month][$row['type']] = (int) $row['total_quantity'];
+        $byMonth[$month]['count'] += (int) $row['movement_count'];
+        if ($row['type'] === 'IN') { $totalIn += (int) $row['total_quantity']; }
+        else { $totalOut += (int) $row['total_quantity']; }
+    }
+    $peak = 1;
+    foreach ($byMonth as $monthData) { $peak = max($peak, $monthData['IN'], $monthData['OUT']); }
+    $topProductsStmt = $db->prepare(
+        'SELECT p.name, SUM(th.quantity) AS moved FROM TRANSACTION_HISTORY th ' .
+        'JOIN PRODUCTS p ON p.id = th.product_id WHERE th.type = \'OUT\' ' .
+        'AND th.created_at >= :start_date AND th.created_at < DATE_ADD(:end_date, INTERVAL 1 DAY) ' .
+        'GROUP BY p.id, p.name ORDER BY moved DESC LIMIT 5'
+    );
+    $topProductsStmt->execute(['start_date' => $startDate, 'end_date' => $endDate]);
+    $topProducts = $topProductsStmt->fetchAll();
+
+    $content = '<div class="card report-summary"><h2>Stock Movement Report</h2>';
+    if ($message) { $content .= '<div class="alert success">' . e($message) . '</div>'; }
+    if ($error) { $content .= '<div class="alert error">' . e($error) . '</div>'; }
+    $content .= '<form method="get" class="inline"><input type="hidden" name="page" value="reports"><div class="field"><label for="report-start">From</label><input id="report-start" type="date" name="start" value="' . e($startDate) . '" required></div><div class="field"><label for="report-end">To</label><input id="report-end" type="date" name="end" value="' . e($endDate) . '" required></div><button class="btn" type="submit">Apply range</button></form>';
+    $content .= '<div class="grid two-col report-stats"><div class="stat"><h3>Stock In</h3><div class="value">' . $totalIn . '</div></div><div class="stat"><h3>Stock Out</h3><div class="value">' . $totalOut . '</div></div><div class="stat"><h3>Net Movement</h3><div class="value">' . ($totalIn - $totalOut) . '</div></div></div></div>';
+    $content .= '<div class="card"><h3>Monthly movement</h3><p class="muted"><span class="legend-in">■</span> Stock in &nbsp; <span class="legend-out">■</span> Stock out</p>';
+    if ($byMonth === []) {
+        $content .= '<p class="muted">No stock movements in this date range.</p>';
+    } else {
+        foreach ($byMonth as $month => $values) {
+            $inWidth = max(1, (int) round($values['IN'] / $peak * 100));
+            $outWidth = max(1, (int) round($values['OUT'] / $peak * 100));
+            $content .= '<div class="chart-row"><strong>' . e(date('M Y', strtotime($month . '-01'))) . '</strong><div class="chart-track"><div class="chart-bar chart-in" style="width:' . $inWidth . '%"></div></div><span>' . $values['IN'] . '</span><div class="chart-track"><div class="chart-bar chart-out" style="width:' . $outWidth . '%"></div></div><span>' . $values['OUT'] . '</span></div>';
+        }
+    }
+    $content .= '</div><div class="card"><h3>Most issued items</h3><table><thead><tr><th>Product</th><th>Units issued</th></tr></thead><tbody>';
+    if ($topProducts === []) { $content .= '<tr><td colspan="2" class="muted">No stock-out records in this range.</td></tr>'; }
+    foreach ($topProducts as $product) { $content .= '<tr><td>' . e($product['name']) . '</td><td>' . (int) $product['moved'] . '</td></tr>'; }
+    $content .= '</tbody></table></div>';
+} elseif ($page === 'audit') {
+    $entries = getAuditEntries($db);
+    $content = '<div class="card"><h2>Audit Log</h2><p class="muted">Recent catalog, stock, user, and import/export changes. Entries are retained when users or catalog records are deactivated.</p>';
+    if ($message) { $content .= '<div class="alert success">' . e($message) . '</div>'; }
+    $content .= '<table><thead><tr><th>Date</th><th>Actor</th><th>Action</th><th>Record</th><th>Summary</th></tr></thead><tbody>';
+    if ($entries === []) { $content .= '<tr><td colspan="5" class="muted">No audit entries yet.</td></tr>'; }
+    foreach ($entries as $entry) {
+        $record = ucfirst($entry['entity_type']) . ($entry['entity_id'] ? ' #' . (int) $entry['entity_id'] : '');
+        $details = $entry['details'] ? json_decode($entry['details'], true) : null;
+        $detailText = is_array($details) ? ' ' . json_encode($details, JSON_UNESCAPED_SLASHES) : '';
+        $content .= '<tr><td>' . e($entry['created_at']) . '</td><td>' . e($entry['actor_name'] ?? 'Deleted account') . '</td><td>' . e($entry['action']) . '</td><td>' . e($record) . '</td><td>' . e($entry['summary'] . $detailText) . '</td></tr>';
+    }
+    $content .= '</tbody></table></div>';
+} elseif ($page === 'users') {
+    $status = ($_GET['status'] ?? 'active') === 'inactive' ? 'inactive' : 'active';
+    $stmt = $db->prepare('SELECT id, name, email, role, is_active FROM USERS WHERE is_active = :active ORDER BY name');
+    $stmt->execute(['active' => $status === 'active' ? 1 : 0]);
+    $users = $stmt->fetchAll();
+    $editId = filter_var($_GET['edit_user'] ?? '', FILTER_VALIDATE_INT);
+    $editingUser = null;
+    if ($editId) {
+        $stmt = $db->prepare('SELECT id, name, email, role, is_active FROM USERS WHERE id = :id');
+        $stmt->execute(['id' => $editId]);
+        $editingUser = $stmt->fetch() ?: null;
+    }
+    $csrfField = '<input type="hidden" name="csrf_token" value="' . e(csrfToken()) . '">';
+    $content = '<div class="card"><h2>User Management</h2><p class="muted">Only Admin can manage accounts. Deactivate accounts to retain their transaction and audit history.</p>';
+    if ($message) { $content .= '<div class="alert success">' . e($message) . '</div>'; }
+    if ($error) { $content .= '<div class="alert error">' . e($error) . '</div>'; }
+    $content .= '<h3>' . ($editingUser ? 'Edit User' : 'Create User') . '</h3><form method="post">' . $csrfField . '<input type="hidden" name="id" value="' . (int) ($editingUser['id'] ?? 0) . '"><div class="grid two-col"><div class="field"><label for="user-name">Name</label><input id="user-name" name="name" maxlength="100" value="' . e($editingUser['name'] ?? '') . '" required></div><div class="field"><label for="user-email">Email</label><input id="user-email" type="email" name="email" maxlength="100" value="' . e($editingUser['email'] ?? '') . '" required></div><div class="field"><label for="user-role">Role</label><select id="user-role" name="role"><option' . (($editingUser['role'] ?? '') === 'Admin' ? ' selected' : '') . '>Admin</option><option' . (($editingUser['role'] ?? '') === 'Manager' ? ' selected' : '') . '>Manager</option><option' . (($editingUser['role'] ?? '') === 'Staff' ? ' selected' : '') . '>Staff</option></select></div><div class="field"><label for="user-password">' . ($editingUser ? 'New password (optional)' : 'Initial password') . '</label><input id="user-password" type="password" name="password" minlength="8" ' . ($editingUser ? '' : 'required') . ' autocomplete="new-password"></div></div><label class="inline"><input type="checkbox" name="is_active" value="1"' . ((int) ($editingUser['is_active'] ?? 1) === 1 ? ' checked' : '') . '> Account active</label><div class="inline"><button class="btn" type="submit" name="save_user">Save User</button>';
+    if ($editingUser) { $content .= '<a class="btn secondary" href="index.php?page=users">Cancel</a>'; }
+    $content .= '</div></form><h3>Accounts</h3><p><a class="btn' . ($status === 'active' ? '' : ' secondary') . '" href="index.php?page=users&status=active">Active</a> <a class="btn' . ($status === 'inactive' ? '' : ' secondary') . '" href="index.php?page=users&status=inactive">Inactive</a></p><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Action</th></tr></thead><tbody>';
+    if ($users === []) { $content .= '<tr><td colspan="4" class="muted">No accounts found.</td></tr>'; }
+    foreach ($users as $account) {
+        $content .= '<tr><td>' . e($account['name']) . '</td><td>' . e($account['email']) . '</td><td>' . e($account['role']) . '</td><td><a class="btn secondary" href="index.php?page=users&edit_user=' . (int) $account['id'] . '">Edit</a>';
+        if ((int) $account['id'] !== (int) $_SESSION['user_id']) {
+            $content .= ' <form method="post" style="display:inline">' . $csrfField . '<input type="hidden" name="user_id" value="' . (int) $account['id'] . '"><button class="btn ' . ($status === 'active' ? 'danger' : '') . '" name="toggle_user">' . ($status === 'active' ? 'Deactivate' : 'Reactivate') . '</button></form>';
+        }
+        $content .= '</td></tr>';
+    }
+    $content .= '</tbody></table></div>';
 } elseif ($page === 'products') {
     $search = trim((string) ($_GET['q'] ?? ''));
     $status = ($_GET['status'] ?? 'active') === 'inactive' ? 'inactive' : 'active';
@@ -604,10 +892,12 @@ if ($page === 'security') {
     $csrfField = '<input type="hidden" name="csrf_token" value="' . e(csrfToken()) . '">';
     $columns = $canManageCatalog ? 6 : 5;
 
-    $content = '<div class="notice">Phase 1 (50% complete). Locked for next phase: bulk import/export, advanced reporting, and full user administration.</div>';
-    $content .= '<div class="card"><h2>Products</h2>';
+    $content = '<div class="card"><h2>Products</h2>';
     if ($message) { $content .= '<div class="alert success">' . e($message) . '</div>'; }
     if ($error) { $content .= '<div class="alert error">' . e($error) . '</div>'; }
+    if ($canManageCatalog) {
+        $content .= '<div class="catalog-tools"><a class="btn secondary" href="index.php?export=products">Export active products</a><form method="post" enctype="multipart/form-data">' . $csrfField . '<label for="products-csv">Import CSV</label><input id="products-csv" type="file" name="csv_file" accept=".csv,text/csv" required><button class="btn" type="submit" name="import_products">Import products</button></form><p class="muted">Columns: sku, name, supplier, reorder_level, opening_quantity. Existing SKUs update catalog details; current stock is not overwritten.</p></div>';
+    }
     $content .= '<div class="inline" style="margin-bottom: 16px;">';
     $content .= '<form method="get" style="display:flex; gap:10px; align-items:end; width: 100%;">';
     $content .= '<input type="hidden" name="page" value="products"><input type="hidden" name="status" value="' . e($status) . '">';
@@ -684,10 +974,10 @@ if ($page === 'security') {
 
     $csrfField = '<input type="hidden" name="csrf_token" value="' . e(csrfToken()) . '">';
 
-    $content = '<div class="notice">Phase 1 (50% complete). Locked for next phase: supplier bulk actions and reporting.</div>';
-    $content .= '<div class="card"><h2>Suppliers</h2>';
+    $content = '<div class="card"><h2>Suppliers</h2>';
     if ($message) { $content .= '<div class="alert success">' . e($message) . '</div>'; }
     if ($error) { $content .= '<div class="alert error">' . e($error) . '</div>'; }
+    $content .= '<div class="catalog-tools"><a class="btn secondary" href="index.php?export=suppliers">Export active suppliers</a><form method="post" enctype="multipart/form-data">' . $csrfField . '<label for="suppliers-csv">Import CSV</label><input id="suppliers-csv" type="file" name="csv_file" accept=".csv,text/csv" required><button class="btn" type="submit" name="import_suppliers">Import suppliers</button></form><p class="muted">Columns: name, contact_person, phone, email. Matching supplier names are updated; other rows are added.</p></div>';
     $content .= '<div class="inline" style="margin-bottom: 16px;"><form method="get" style="display:flex; gap:10px; width:100%; align-items:end;"><input type="hidden" name="page" value="suppliers"><input type="hidden" name="status" value="' . e($status) . '"><div class="field" style="flex:1; min-width:180px;"><label>Search</label><input type="text" name="q" value="' . e($search) . '" placeholder="Supplier name"></div><button class="btn secondary" type="submit">Search</button></form></div>';
     $content .= '<h3>' . ($editingSupplier ? 'Edit Supplier' : 'Add Supplier') . '</h3><form method="post">' . $csrfField . '<input type="hidden" name="id" value="' . (int) ($editingSupplier['id'] ?? 0) . '"><div class="grid two-col"><div class="field"><label>Name</label><input type="text" name="name" maxlength="150" value="' . e($editingSupplier['name'] ?? '') . '" required></div><div class="field"><label>Contact Person</label><input type="text" name="contact_person" maxlength="100" value="' . e($editingSupplier['contact_person'] ?? '') . '"></div><div class="field"><label>Phone</label><input type="text" name="phone" maxlength="30" value="' . e($editingSupplier['phone'] ?? '') . '"></div><div class="field"><label>Email</label><input type="email" name="email" maxlength="100" value="' . e($editingSupplier['email'] ?? '') . '"></div></div><div class="inline"><button type="submit" name="save_supplier" class="btn">Save Supplier</button>';
     if ($editingSupplier) {
@@ -711,8 +1001,7 @@ if ($page === 'security') {
     $products = $stmt->fetchAll();
     $history = getRecentTransactions($db, 12);
 
-    $content = '<div class="notice">Phase 1 (50% complete). Locked for next phase: multi-item batch stock updates and exports.</div>';
-    $content .= '<div class="card"><h2>Stock Movement</h2>';
+    $content = '<div class="card"><h2>Stock Movement</h2>';
     if ($message) { $content .= '<div class="alert success">' . e($message) . '</div>'; }
     if ($error) { $content .= '<div class="alert error">' . e($error) . '</div>'; }
     $content .= '<form method="post"><input type="hidden" name="csrf_token" value="' . e(csrfToken()) . '"><div class="grid two-col"><div class="field"><label>Product</label><select name="product_id" required><option value="">Select Product</option>';
@@ -734,8 +1023,7 @@ if ($page === 'security') {
     $lowStock = getLowStockList($db);
     $latest = getRecentTransactions($db, 5);
 
-    $content = '<div class="notice">Phase 1 (50% complete). Locked for next phase: admin user management, audit logs, and advanced reporting.</div>';
-    $content .= '<div class="card"><h2>Dashboard</h2>';
+    $content = '<div class="card dashboard-summary"><h2>Dashboard</h2>';
     if ($message) { $content .= '<div class="alert success">' . e($message) . '</div>'; }
     if ($error) { $content .= '<div class="alert error">' . e($error) . '</div>'; }
     $content .= '<div class="grid two-col"><div class="stat"><h3>In Stock</h3><div class="value">' . $stats['in_stock'] . '</div></div><div class="stat"><h3>Low Stock</h3><div class="value">' . $stats['low_stock'] . '</div></div><div class="stat"><h3>Out of Stock</h3><div class="value">' . $stats['out_of_stock'] . '</div></div><div class="stat"><h3>Total Active Products</h3><div class="value">' . $stats['total'] . '</div></div></div></div>';

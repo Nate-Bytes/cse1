@@ -241,7 +241,7 @@ function completeLogin(array $user): void
     $_SESSION['user_role'] = $user['role'];
 }
 
-function e(string $value): string
+function e(?string $value): string
 {
     return htmlspecialchars($value ?? '', ENT_QUOTES, 'UTF-8');
 }
@@ -264,9 +264,13 @@ function getUserById(PDO $db, int $id): ?array
     return $user ?: null;
 }
 
-function getSupplierOptions(PDO $db): array
+function getSupplierOptions(PDO $db, ?int $includeId = null): array
 {
-    $stmt = $db->query('SELECT id, name FROM SUPPLIERS WHERE is_active = 1 ORDER BY name ASC');
+    // Active suppliers, plus the one a product already uses (even if inactive),
+    // so editing a product never silently switches its supplier.
+    $stmt = $db->prepare('SELECT id, name, is_active FROM SUPPLIERS WHERE is_active = 1 OR id = :include_id ORDER BY name ASC');
+    $stmt->bindValue(':include_id', $includeId ?? 0, PDO::PARAM_INT);
+    $stmt->execute();
     return $stmt->fetchAll();
 }
 
@@ -305,7 +309,7 @@ function getRecentTransactions(PDO $db, int $limit = 8): array
         'FROM TRANSACTION_HISTORY th ' .
         'LEFT JOIN PRODUCTS p ON p.id = th.product_id ' .
         'LEFT JOIN USERS u ON u.id = th.user_id ' .
-        'ORDER BY th.created_at DESC LIMIT :limit'
+        'ORDER BY th.created_at DESC, th.id DESC LIMIT :limit'
     );
     $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
     $stmt->execute();
@@ -322,6 +326,11 @@ function renderNavbar(string $currentPage, array $user): string
         'stock' => 'Stock Movement',
         'security' => 'Security',
     ];
+
+    // Staff have a read-only product catalog and no supplier management.
+    if (!in_array($user['role'] ?? '', ['Admin', 'Manager'], true)) {
+        unset($nav['suppliers']);
+    }
 
     $html = '<nav class="nav">';
     foreach ($nav as $page => $label) {

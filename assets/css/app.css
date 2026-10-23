@@ -96,30 +96,174 @@ a {
 }
 
 .brand-mark {
-    display: flex;
-    align-items: end;
-    gap: 3px;
-    height: 28px;
-    padding: 4px;
-    border: 1px solid rgba(255, 255, 255, 0.4);
+    display: grid;
+    width: 39px;
+    height: 39px;
+    flex: 0 0 39px;
+    place-items: center;
+    padding: 0;
+    color: #f8f2e7;
+    background: #c74632;
+    border: 1px solid #e56c56;
     border-radius: 3px;
+    font-family: "Barlow Condensed", Impact, sans-serif;
+    font-size: 17px;
+    font-weight: 700;
+    line-height: 1;
+}
+
+.brand-mark b {
+    font-weight: 700;
 }
 
 .brand-mark i {
-    display: block;
-    width: 4px;
-    height: 12px;
-    background: var(--yellow);
+    display: none;
 }
 
-.brand-mark i:nth-child(2) {
-    height: 18px;
-    background: #62a88d;
+.dashboard-page {
+    display: flex;
+    min-height: calc(100vh - 114px);
+    flex-direction: column;
+    gap: 13px;
 }
 
-.brand-mark i:nth-child(3) {
-    height: 14px;
-    background: #e27d62;
+.dashboard-heading,
+.panel-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.dashboard-heading h2 {
+    padding-bottom: 0;
+    margin: 0;
+    border: 0;
+}
+
+.dashboard-heading .eyebrow {
+    margin-bottom: 2px;
+    color: #a83527;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 9px;
+}
+
+.dashboard-period {
+    padding: 6px 8px;
+    color: #565b52;
+    background: #e9e6dc;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 9px;
+}
+
+.dashboard-stats {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 9px;
+}
+
+.dashboard-stats .stat {
+    min-height: 81px;
+    padding: 11px 12px;
+}
+
+.dashboard-stats .stat h3 {
+    margin-bottom: 9px;
+    font-size: 9px;
+}
+
+.dashboard-stats .stat .value {
+    font-size: 25px;
+}
+
+.dashboard-lower {
+    display: grid;
+    min-height: 0;
+    flex: 1 1 auto;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 13px;
+}
+
+.dashboard-panel {
+    min-height: 0;
+    margin: 0;
+    padding: 15px 16px;
+}
+
+.panel-heading h3 {
+    margin: 0 0 10px;
+    font-size: 19px;
+    text-transform: uppercase;
+}
+
+.panel-heading a {
+    flex: 0 0 auto;
+    margin-bottom: 8px;
+    color: #a83527;
+    font-size: 11px;
+    font-weight: 600;
+    text-decoration: none;
+}
+
+.dashboard-panel .muted {
+    margin-bottom: 8px;
+    font-size: 11px;
+}
+
+.dashboard-panel th,
+.dashboard-panel td {
+    padding: 8px 7px;
+    font-size: 11px;
+}
+
+.dashboard-panel th {
+    font-size: 9px;
+}
+
+.dashboard-chart-row {
+    display: grid;
+    grid-template-columns: 42px minmax(25px, 1fr) 28px minmax(25px, 1fr) 28px;
+    align-items: center;
+    gap: 7px;
+    margin: 9px 0;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+}
+
+.dashboard-chart-row .chart-track {
+    height: 9px;
+}
+
+.movement-in { color: #137969; font-weight: 700; }
+.movement-out { color: #bd412e; font-weight: 700; }
+
+.dashboard-page .alert {
+    padding: 8px 10px;
+    margin: 0;
+    font-size: 12px;
+}
+
+@media (max-width: 1100px) {
+    .dashboard-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+@media (max-width: 700px) {
+    .dashboard-page { min-height: calc(100vh - 70px); }
+    .dashboard-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .dashboard-lower { grid-template-columns: 1fr; }
+    .dashboard-panel { overflow-x: auto; }
+    .dashboard-heading h2 { font-size: 28px; }
+}
+
+@media (max-height: 680px) and (min-width: 701px) {
+    .workspace { padding-bottom: 14px; }
+    .workspace-bar { min-height: 42px; margin-bottom: 14px; }
+    .dashboard-page { min-height: 0; }
+    .dashboard-page { gap: 8px; }
+    .dashboard-stats .stat { min-height: 69px; padding: 8px 10px; }
+    .dashboard-panel { padding: 11px 13px; }
+    .dashboard-panel th, .dashboard-panel td { padding: 6px; }
+    .dashboard-chart-row { margin: 6px 0; }
 }
 
 .brand-copy {
@@ -988,3 +1132,24 @@ tbody tr:hover { background: #eaf1ec; }
     .workspace-bar time { font-size: 8px; }
     .sidebar-bottom { flex-wrap: wrap; }
 }
+
+.brand-mark {
+    display: grid;
+    width: 39px;
+    height: 39px;
+    flex: 0 0 39px;
+    align-items: center;
+    justify-items: center;
+    padding: 0;
+    color: #f8f2e7;
+    background: #c74632;
+    border: 1px solid #e56c56;
+    border-radius: 3px;
+    font-family: "Barlow Condensed", Impact, sans-serif;
+    font-size: 17px;
+    font-weight: 700;
+    line-height: 1;
+}
+
+.brand-mark b { font-weight: 700; }
+.brand-mark i { display: none; }

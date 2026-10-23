@@ -91,6 +91,17 @@ function requireLogin(): void
     }
 }
 
+function clearPendingTwoFactor(): void
+{
+    unset(
+        $_SESSION['pending_2fa_user_id'],
+        $_SESSION['pending_2fa_attempts'],
+        $_SESSION['pending_2fa_enrollment'],
+        $_SESSION['totp_setup_secret'],
+        $_SESSION['totp_setup_attempts']
+    );
+}
+
 function requireRole(array $roles): void
 {
     requireLogin();
@@ -254,6 +265,7 @@ function completeLogin(array $user): void
         $_SESSION['csrf_token'],
         $_SESSION['pending_2fa_user_id'],
         $_SESSION['pending_2fa_attempts'],
+        $_SESSION['pending_2fa_enrollment'],
         $_SESSION['totp_setup_secret']
     );
     $_SESSION['user_id'] = (int) $user['id'];
@@ -309,15 +321,17 @@ function getDashboardStats(PDO $db): array
     ];
 }
 
-function getLowStockList(PDO $db): array
+function getLowStockList(PDO $db, int $limit = 10): array
 {
-    $stmt = $db->query(
+    $stmt = $db->prepare(
         'SELECT p.id, p.name, p.quantity, p.reorder_level, s.name AS supplier_name ' .
         'FROM PRODUCTS p ' .
         'LEFT JOIN SUPPLIERS s ON s.id = p.supplier_id ' .
         'WHERE p.is_active = 1 AND p.quantity <= p.reorder_level AND p.quantity > 0 ' .
-        'ORDER BY p.quantity ASC, p.name ASC LIMIT 10'
+        'ORDER BY p.quantity ASC, p.name ASC LIMIT :limit'
     );
+    $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+    $stmt->execute();
 
     return $stmt->fetchAll();
 }
@@ -572,8 +586,11 @@ function renderNavbar(string $currentPage, array $user): string
     ];
 
     $role = $user['role'] ?? '';
+    $roleLabel = $role === 'Staff' ? 'Press Operator' : $role;
     if (!in_array($role, ['Admin', 'Manager'], true)) {
         unset($nav['suppliers']);
+    } else {
+        unset($nav['stock']);
     }
     if (in_array($role, ['Admin', 'Manager'], true)) {
         $nav['reports'] = 'Reports';
@@ -583,12 +600,12 @@ function renderNavbar(string $currentPage, array $user): string
         $nav['users'] = 'Users';
     }
 
-    $html = '<aside class="sidebar"><a class="brand" href="index.php?page=dashboard"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span><span class="brand-copy"><strong>Printing press</strong><small>Production stock</small></span></a><p class="sidebar-label">WORKSPACE</p><nav class="nav-links" aria-label="Main navigation">';
+    $html = '<aside class="sidebar"><a class="brand" href="index.php?page=dashboard"><span class="brand-mark" aria-hidden="true"><b>RJ</b></span><span class="brand-copy"><strong>RJ Printing Press</strong><small>Inventory control</small></span></a><p class="sidebar-label">WORKSPACE</p><nav class="nav-links" aria-label="Main navigation">';
     foreach ($nav as $page => $label) {
         $active = $currentPage === $page ? ' active' : '';
         $html .= '<a class="nav-item' . $active . '" href="index.php?page=' . $page . '"' . ($currentPage === $page ? ' aria-current="page"' : '') . '>' . $label . '</a>';
     }
-    $html .= '</nav><div class="sidebar-bottom"><div class="account-chip"><span class="account-initial">' . e(mb_strtoupper(mb_substr($user['name'] ?? '', 0, 1))) . '</span><span class="account-copy"><strong>' . e($user['name'] ?? '') . '</strong><small>' . e($user['role'] ?? '') . '</small></span></div><a class="signout-link" href="index.php?logout=1">Sign out <span aria-hidden="true">↗</span></a></div></aside>';
+    $html .= '</nav><div class="sidebar-bottom"><div class="account-chip"><span class="account-initial">' . e(mb_strtoupper(mb_substr($user['name'] ?? '', 0, 1))) . '</span><span class="account-copy"><strong>' . e($user['name'] ?? '') . '</strong><small>' . e($roleLabel) . '</small></span></div><a class="signout-link" href="index.php?logout=1">Sign out <span aria-hidden="true">↗</span></a></div></aside>';
 
     return $html;
 }
@@ -601,21 +618,21 @@ function renderLayout(string $title, string $content, string $currentPage, array
     <head>
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>' . e($title) . '</title>
+        <title>' . e($title) . ' | RJ Printing Press</title>
         <link rel="preconnect" href="https://fonts.googleapis.com">
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
         <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
         <link rel="stylesheet" href="assets/css/app.css" />
     </head>
     <body>
-        <div class="app-shell">' . renderNavbar($currentPage, $user) . '<main class="workspace"><div class="workspace-bar"><span><i></i> PRINT FLOOR / STOCK CONTROL</span><time>' . e(date('D, d M Y')) . '</time></div><div class="container">' . $content . '</div></main></div>
+        <div class="app-shell">' . renderNavbar($currentPage, $user) . '<main class="workspace"><div class="workspace-bar"><span><i></i> RJ PRINTING PRESS / STOCK CONTROL</span><time>' . e(date('D, d M Y')) . '</time></div><div class="container">' . $content . '</div></main></div>
     </body>
     </html>';
 }
 
 function renderAuthShell(string $title, string $content): string
 {
-    return '<!doctype html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>' . e($title) . ' | Printing press</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet"><link rel="stylesheet" href="assets/css/app.css"></head><body class="auth-body"><main class="auth-shell"><aside class="auth-story"><a class="brand brand-light" href="index.php"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span><span class="brand-copy"><strong>Printing press</strong><small>Production stock</small></span></a><div class="auth-story-copy"><p class="eyebrow">PRINT SHOP / STOCK DESK</p><h1>Keep every press run moving.</h1><p>Paper, ink, plates, and finishing supplies, all accounted for.</p><div class="print-swatches" aria-hidden="true"><span></span><span></span><span></span><span></span></div></div></aside><section class="auth-main"><div class="auth-panel"><p class="eyebrow">' . e($title) . '</p>' . $content . '</div></section></main></body></html>';
+    return '<!doctype html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>' . e($title) . ' | RJ Printing Press</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet"><link rel="stylesheet" href="assets/css/app.css"></head><body class="auth-body"><main class="auth-shell"><aside class="auth-story"><a class="brand brand-light" href="index.php"><span class="brand-mark" aria-hidden="true"><b>RJ</b></span><span class="brand-copy"><strong>RJ Printing Press</strong><small>Inventory control</small></span></a><div class="auth-story-copy"><p class="eyebrow">PRINT SHOP / STOCK DESK</p><h1>Keep every press run moving.</h1><p>Paper, ink, plates, and finishing supplies, all accounted for.</p><div class="print-swatches" aria-hidden="true"><span></span><span></span><span></span><span></span></div></div></aside><section class="auth-main"><div class="auth-panel"><p class="eyebrow">' . e($title) . '</p>' . $content . '</div></section></main></body></html>';
 }
 
 function renderLoginPage(?string $message = null, ?string $error = null): string
@@ -665,4 +682,28 @@ function renderTotpLoginPage(?string $error = null): string
     </form>';
 
     return renderAuthShell('Two-factor verification', $html);
+}
+
+function renderTotpEnrollmentPage(string $email, string $secret, ?string $error = null): string
+{
+    $label = rawurlencode('RJ Printing Press:' . $email);
+    $otpauthUri = 'otpauth://totp/' . $label . '?secret=' . rawurlencode($secret) . '&issuer=RJ%20Printing%20Press&algorithm=SHA1&digits=6&period=30';
+    $html = '<h2>Secure your account.</h2><p class="auth-subtitle">Two-factor authentication is required. Scan the QR code, then verify with your current six-digit code.</p>';
+    if ($error) {
+        $html .= '<div class="alert error">' . e($error) . '</div>';
+    }
+    $html .= '<div id="totp-qr" class="qr-code" role="img" aria-label="Authenticator setup QR code" data-qr-value="' . e($otpauthUri) . '"></div>
+        <p class="muted">Manual setup key: <code>' . e($secret) . '</code></p>
+        <p id="totp-qr-error" class="alert error" hidden>The QR code could not be displayed. Use the setup key above instead.</p>
+        <form method="post" class="auth-form"><input type="hidden" name="csrf_token" value="' . e(csrfToken()) . '">
+        <div class="field"><label for="totp_code">Authenticator code</label><input id="totp_code" type="text" name="totp_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required autofocus></div>
+        <button type="submit" name="confirm_required_2fa" class="btn">Verify and continue</button></form>
+        <script src="assets/vendor/qrcode.js"></script><script src="assets/vendor/qrcode_UTF8.js"></script><script>
+            (function () {
+                var target = document.getElementById("totp-qr");
+                try { var qr = qrcode(0, "M"); qr.addData(target.getAttribute("data-qr-value"), "Byte"); qr.make(); target.innerHTML = qr.createSvgTag(5, 4); }
+                catch (error) { document.getElementById("totp-qr-error").hidden = false; }
+            }());
+        </script>';
+    return renderAuthShell('Required two-factor setup', $html);
 }

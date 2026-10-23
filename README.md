@@ -5,7 +5,7 @@ This project is a small PHP + MySQL inventory app for a printing press business.
 ## Included in this phase
 - MySQL schema and sample data for a print shop
 - Login/logout with role checks
-- Optional authenticator-app two-factor authentication (TOTP)
+- Required authenticator-app two-factor authentication (TOTP)
 - Admin/Manager/Staff permissions enforced on the server
 - Dashboard with in-stock, low-stock, and out-of-stock counts
 - Product/supplier search, add/edit, deactivate, and restore
@@ -32,11 +32,11 @@ This project is a small PHP + MySQL inventory app for a printing press business.
 
 For an existing installation, do not re-import `schema.sql`; it would erase the database. The app creates the audit table on first request.
 
-### Opt into 2FA for demo accounts
+### Required 2FA enrollment
 
-2FA is optional and configured separately for each account. Sign in with the demo account you want to protect, open **Security**, and choose **Enable 2FA for this account**. Enter that account's password, scan the QR code with your authenticator app (or enter the displayed key manually), then enter the app's six-digit code to confirm. The QR code is generated locally by the app; the setup secret is not sent to a QR service. Repeat with the other demo accounts only if you want them protected too. Existing accounts and passwords are preserved.
+Every account must use 2FA, and it cannot be turned off. On the first sign-in, after entering an account password, scan the QR code with an authenticator app (or enter the displayed key manually), then enter its six-digit code to finish enrollment and continue. The QR code is generated locally by the app; the setup secret is not sent to a QR service. Existing accounts and passwords are preserved.
 
-When you first enable 2FA, the app creates its private encryption key automatically at `C:\xampp\apache\conf\cse1-totp.key`, outside the web root. No command-line setup, Apache configuration change, or restart is needed. Keep this key file private and backed up; enrolled authenticator secrets cannot be decrypted without it. If your XAMPP folder is elsewhere, configure `CSE1_TOTP_KEY_FILE` to a private path outside the web root before enabling 2FA. The optional `setup_totp_key.php` utility can create the key in advance and never displays or overwrites an existing key.
+Before first enrollment, the app creates its private encryption key automatically at `C:\xampp\apache\conf\cse1-totp.key`, outside the web root. No command-line setup, Apache configuration change, or restart is needed. Keep this key file private and backed up; enrolled authenticator secrets cannot be decrypted without it. If your XAMPP folder is elsewhere, configure `CSE1_TOTP_KEY_FILE` to a private path outside the web root. The `setup_totp_key.php` utility can create the key in advance and never displays or overwrites an existing key.
 
 Future logins for an enrolled account ask for an authenticator code after the password. Five invalid codes temporarily block further attempts for five minutes. Use HTTPS whenever the app is accessed anywhere beyond the local machine.
 
@@ -53,9 +53,9 @@ WHERE email = 'user@example.com';
 ```
 
 ## Roles
-- Admin: all pages, catalog, reports, audit log, and account management.
-- Manager: catalog, stock movements, and reports; no account or audit-log management.
-- Staff: read-only catalog, stock movements, dashboard, and account security.
+- Admin: catalog, management analytics, audit log, and account management; no stock movement page or transaction details.
+- Manager: catalog and management analytics; no stock movement page, account management, or audit-log management.
+- Staff (press operator): read-only catalog, stock movement entry and history, dashboard, and account security.
 
 Users, products, and suppliers are deactivated rather than physically deleted so linked stock and audit history remain available. At least one active Admin account is required.
 

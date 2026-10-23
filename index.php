@@ -38,29 +38,78 @@ if (!isLoggedIn()) {
                         $_SESSION['pending_2fa_attempts'] = 0;
                     }
                 } else {
-                    completeLogin($user);
-                    header('Location: index.php?page=dashboard');
-                    exit;
+                    try {
+                        totpEncryptionKey();
+                        session_regenerate_id(true);
+                        unset($_SESSION['csrf_token']);
+                        $_SESSION['pending_2fa_user_id'] = (int) $user['id'];
+                        $_SESSION['pending_2fa_enrollment'] = true;
+                        $_SESSION['totp_setup_secret'] = generateTotpSecret();
+                        $_SESSION['totp_setup_attempts'] = 0;
+                    } catch (RuntimeException $e) {
+                        $error = $e->getMessage();
+                    }
                 }
             } else {
                 $error = 'Invalid email or password.';
             }
         }
 
+    } elseif ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['confirm_required_2fa'])) {
+        if (!hasValidCsrfToken()) {
+            $error = 'Your session expired. Please sign in again.';
+            clearPendingTwoFactor();
+        } elseif (!empty($_SESSION['pending_2fa_enrollment']) && !empty($_SESSION['pending_2fa_user_id']) && !empty($_SESSION['totp_setup_secret'])) {
+            $user = getUserById($db, (int) $_SESSION['pending_2fa_user_id']);
+            if (!$user || (int) $user['is_active'] !== 1 || (int) $user['totp_enabled'] === 1) {
+                clearPendingTwoFactor();
+                $error = 'Sign-in could not be verified. Please sign in again.';
+            } else {
+                $secret = (string) $_SESSION['totp_setup_secret'];
+                $counter = verifyTotpCode($secret, trim((string) ($_POST['totp_code'] ?? '')));
+                if ($counter === null) {
+                    $_SESSION['totp_setup_attempts'] = (int) ($_SESSION['totp_setup_attempts'] ?? 0) + 1;
+                    $error = 'The authenticator code is invalid or expired.';
+                    if ($_SESSION['totp_setup_attempts'] >= 5) {
+                        clearPendingTwoFactor();
+                        $error = 'Too many incorrect codes. Sign in again to restart 2FA enrollment.';
+                    }
+                } else {
+                    try {
+                        $encryptedSecret = encryptTotpSecret($secret);
+                        $save = $db->prepare(
+                            'UPDATE USERS SET totp_secret = :secret, totp_enabled = 1, totp_last_used = :counter, ' .
+                            'totp_failed_attempts = 0, totp_locked_until = NULL WHERE id = :id AND totp_enabled = 0'
+                        );
+                        $save->execute(['secret' => $encryptedSecret, 'counter' => $counter, 'id' => $user['id']]);
+                        if ($save->rowCount() === 1) {
+                            completeLogin($user);
+                            header('Location: index.php?page=dashboard');
+                            exit;
+                        }
+                        $error = '2FA could not be enabled. Please sign in again.';
+                    } catch (RuntimeException $e) {
+                        $error = $e->getMessage();
+                    }
+                }
+            }
+        } else {
+            $error = 'Enrollment session expired. Please sign in again.';
+        }
     } elseif ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['verify_2fa'])) {
         if (!hasValidCsrfToken()) {
             $error = 'Your session expired. Please sign in again.';
-            unset($_SESSION['pending_2fa_user_id'], $_SESSION['pending_2fa_attempts']);
+            clearPendingTwoFactor();
         } elseif (!empty($_SESSION['pending_2fa_user_id'])) {
             $user = getUserById($db, (int) $_SESSION['pending_2fa_user_id']);
             if (!$user || (int) $user['is_active'] !== 1 || (int) $user['totp_enabled'] !== 1) {
-                unset($_SESSION['pending_2fa_user_id'], $_SESSION['pending_2fa_attempts']);
+                clearPendingTwoFactor();
                 $error = 'Sign-in could not be verified. Please sign in again.';
             } elseif (!empty($user['totp_locked_until']) && strtotime($user['totp_locked_until']) > time()) {
-                unset($_SESSION['pending_2fa_user_id'], $_SESSION['pending_2fa_attempts']);
+                clearPendingTwoFactor();
                 $error = 'Too many incorrect codes. Please wait five minutes before trying again.';
             } elseif (empty($user['totp_secret'])) {
-                unset($_SESSION['pending_2fa_user_id'], $_SESSION['pending_2fa_attempts']);
+                clearPendingTwoFactor();
                 $error = 'Two-factor sign-in is not configured correctly. Contact the system administrator.';
             } else {
                 try {
@@ -105,7 +154,7 @@ if (!isLoggedIn()) {
                             ? 'Too many incorrect codes. Please wait five minutes before trying again.'
                             : 'The authenticator code is invalid or expired.';
                         if ($attempts >= 5) {
-                            unset($_SESSION['pending_2fa_user_id'], $_SESSION['pending_2fa_attempts']);
+                            clearPendingTwoFactor();
                         }
                     }
                 }
@@ -114,13 +163,18 @@ if (!isLoggedIn()) {
             $error = 'Sign-in session expired. Please enter your email and password again.';
         }
     } elseif (isset($_GET['cancel_2fa'])) {
-        unset($_SESSION['pending_2fa_user_id'], $_SESSION['pending_2fa_attempts']);
+        clearPendingTwoFactor();
         header('Location: index.php');
         exit;
     }
 
     if (!empty($_SESSION['pending_2fa_user_id'])) {
-        echo renderTotpLoginPage($error);
+        if (!empty($_SESSION['pending_2fa_enrollment']) && !empty($_SESSION['totp_setup_secret'])) {
+            $pendingUser = getUserById($db, (int) $_SESSION['pending_2fa_user_id']);
+            echo renderTotpEnrollmentPage($pendingUser['email'] ?? '', (string) $_SESSION['totp_setup_secret'], $error);
+        } else {
+            echo renderTotpLoginPage($error);
+        }
         exit;
     }
     echo renderLoginPage($message, $error);
@@ -131,6 +185,9 @@ requireLogin();
 
 $authenticatedUser = getUserById($db, (int) $_SESSION['user_id']);
 if (!$authenticatedUser || (int) $authenticatedUser['is_active'] !== 1) {
+    logoutUser();
+}
+if ((int) $authenticatedUser['totp_enabled'] !== 1) {
     logoutUser();
 }
 $_SESSION['user_name'] = $authenticatedUser['name'];
@@ -154,7 +211,7 @@ $pageRoles = [
     'dashboard' => ['Admin', 'Manager', 'Staff'],
     'products' => ['Admin', 'Manager', 'Staff'],
     'suppliers' => ['Admin', 'Manager'],
-    'stock' => ['Admin', 'Manager', 'Staff'],
+    'stock' => ['Staff'],
     'security' => ['Admin', 'Manager', 'Staff'],
     'reports' => ['Admin', 'Manager'],
     'audit' => ['Admin'],
@@ -181,8 +238,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
-    if (isset($_POST['post_stock']) && !in_array($role, ['Admin', 'Manager', 'Staff'], true)) {
-        denyAccess('You are not allowed to post stock movements.', $page, $user);
+    if (isset($_POST['post_stock']) && $role !== 'Staff') {
+        denyAccess('Only press operators can post stock movements.', $page, $user);
     }
 
     foreach (array_merge($userActions, $importActions) as $action) {
@@ -397,39 +454,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['confirm_totp_setup'])
                 } else {
                     $error = '2FA could not be enabled. Reload the page and check your account status.';
                 }
-            }
-        }
-    }
-}
-
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['disable_totp'])) {
-    if (!hasValidCsrfToken()) {
-        $error = 'Your session expired. Reload this page and try again.';
-    } else {
-        $user = getUserById($db, (int) $_SESSION['user_id']);
-        if (!$user || !password_verify((string) ($_POST['current_password'] ?? ''), $user['password_hash'])) {
-            $error = 'Enter your current password and authenticator code to turn off 2FA.';
-        } elseif ((int) $user['totp_enabled'] !== 1) {
-            $error = 'Two-factor authentication is not enabled.';
-        } elseif (empty($user['totp_secret'])) {
-            $error = 'Two-factor authentication is not configured correctly. Contact the system administrator.';
-        } else {
-            try {
-                $secret = decryptTotpSecret($user['totp_secret']);
-                $lastCounter = $user['totp_last_used'] === null ? null : (int) $user['totp_last_used'];
-                $counter = verifyTotpCode($secret, trim((string) ($_POST['totp_code'] ?? '')), $lastCounter);
-                if ($counter === null) {
-                    $error = 'The authenticator code is invalid or expired.';
-                } else {
-                    $disable = $db->prepare(
-                        'UPDATE USERS SET totp_secret = NULL, totp_enabled = 0, totp_last_used = NULL, ' .
-                        'totp_failed_attempts = 0, totp_locked_until = NULL WHERE id = :id AND totp_enabled = 1'
-                    );
-                    $disable->execute(['id' => $user['id']]);
-                    $message = 'Two-factor authentication has been turned off.';
-                }
-            } catch (RuntimeException $e) {
-                $error = $e->getMessage();
             }
         }
     }
@@ -716,18 +740,10 @@ if ($page === 'security') {
     $content = '<div class="card"><h2>Account security</h2>';
     if ($message) { $content .= '<div class="alert success">' . e($message) . '</div>'; }
     if ($error) { $content .= '<div class="alert error">' . e($error) . '</div>'; }
-    $content .= '<p>Two-factor authentication is optional. Turn it on for this account here; repeat these steps with each demo account you want to protect.</p>';
+    $content .= '<p>Two-factor authentication is required for every account and cannot be turned off.</p>';
 
     if ($twoFactorEnabled) {
-        $content .= '<p>Two-factor authentication is <strong>enabled</strong> for this account.</p>';
-        $content .= '<h3>Turn off two-factor authentication</h3>';
-        $content .= '<p class="muted">Confirm with your account password and a current authenticator code.</p>';
-        $content .= '<form method="post">
-            <input type="hidden" name="csrf_token" value="' . e(csrfToken()) . '">
-            <div class="field"><label for="disable_password">Current password</label><input id="disable_password" type="password" name="current_password" required autocomplete="current-password"></div>
-            <div class="field"><label for="disable_code">Authenticator code</label><input id="disable_code" type="text" name="totp_code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required autocomplete="one-time-code"></div>
-            <button type="submit" name="disable_totp" class="btn danger">Turn off 2FA</button>
-        </form>';
+        $content .= '<p>Two-factor authentication is <strong>enabled</strong> for this account. Sign-in requires your authenticator code.</p>';
     } elseif (!empty($_SESSION['totp_setup_secret'])) {
         $secret = (string) $_SESSION['totp_setup_secret'];
         $label = rawurlencode('CSE1 Inventory:' . $account['email']);
@@ -759,13 +775,7 @@ if ($page === 'security') {
                 }());
             </script>';
     } else {
-        $content .= '<p>Two-factor authentication is <strong>off</strong> for this account.</p>';
-        $content .= '<p>Use an authenticator app such as Google Authenticator, Microsoft Authenticator, or Authy. Setup requires your current password.</p>';
-        $content .= '<form method="post">
-            <input type="hidden" name="csrf_token" value="' . e(csrfToken()) . '">
-            <div class="field"><label for="setup_password">Current password</label><input id="setup_password" type="password" name="current_password" required autocomplete="current-password"></div>
-            <button type="submit" name="begin_totp_setup" class="btn">Enable 2FA for this account</button>
-        </form>';
+        $content .= '<p>Setup begins automatically the first time you sign in after entering your password.</p>';
     }
     $content .= '</div>';
 } elseif ($page === 'reports') {
@@ -848,12 +858,13 @@ if ($page === 'security') {
     $content = '<div class="card"><h2>User Management</h2><p class="muted">Only Admin can manage accounts. Deactivate accounts to retain their transaction and audit history.</p>';
     if ($message) { $content .= '<div class="alert success">' . e($message) . '</div>'; }
     if ($error) { $content .= '<div class="alert error">' . e($error) . '</div>'; }
-    $content .= '<h3>' . ($editingUser ? 'Edit User' : 'Create User') . '</h3><form method="post">' . $csrfField . '<input type="hidden" name="id" value="' . (int) ($editingUser['id'] ?? 0) . '"><div class="grid two-col"><div class="field"><label for="user-name">Name</label><input id="user-name" name="name" maxlength="100" value="' . e($editingUser['name'] ?? '') . '" required></div><div class="field"><label for="user-email">Email</label><input id="user-email" type="email" name="email" maxlength="100" value="' . e($editingUser['email'] ?? '') . '" required></div><div class="field"><label for="user-role">Role</label><select id="user-role" name="role"><option' . (($editingUser['role'] ?? '') === 'Admin' ? ' selected' : '') . '>Admin</option><option' . (($editingUser['role'] ?? '') === 'Manager' ? ' selected' : '') . '>Manager</option><option' . (($editingUser['role'] ?? '') === 'Staff' ? ' selected' : '') . '>Staff</option></select></div><div class="field"><label for="user-password">' . ($editingUser ? 'New password (optional)' : 'Initial password') . '</label><input id="user-password" type="password" name="password" minlength="8" ' . ($editingUser ? '' : 'required') . ' autocomplete="new-password"></div></div><label class="inline"><input type="checkbox" name="is_active" value="1"' . ((int) ($editingUser['is_active'] ?? 1) === 1 ? ' checked' : '') . '> Account active</label><div class="inline"><button class="btn" type="submit" name="save_user">Save User</button>';
+    $content .= '<h3>' . ($editingUser ? 'Edit User' : 'Create User') . '</h3><form method="post">' . $csrfField . '<input type="hidden" name="id" value="' . (int) ($editingUser['id'] ?? 0) . '"><div class="grid two-col"><div class="field"><label for="user-name">Name</label><input id="user-name" name="name" maxlength="100" value="' . e($editingUser['name'] ?? '') . '" required></div><div class="field"><label for="user-email">Email</label><input id="user-email" type="email" name="email" maxlength="100" value="' . e($editingUser['email'] ?? '') . '" required></div><div class="field"><label for="user-role">Role</label><select id="user-role" name="role"><option' . (($editingUser['role'] ?? '') === 'Admin' ? ' selected' : '') . '>Admin</option><option' . (($editingUser['role'] ?? '') === 'Manager' ? ' selected' : '') . '>Manager</option><option value="Staff"' . (($editingUser['role'] ?? '') === 'Staff' ? ' selected' : '') . '>Press Operator</option></select></div><div class="field"><label for="user-password">' . ($editingUser ? 'New password (optional)' : 'Initial password') . '</label><input id="user-password" type="password" name="password" minlength="8" ' . ($editingUser ? '' : 'required') . ' autocomplete="new-password"></div></div><label class="inline"><input type="checkbox" name="is_active" value="1"' . ((int) ($editingUser['is_active'] ?? 1) === 1 ? ' checked' : '') . '> Account active</label><div class="inline"><button class="btn" type="submit" name="save_user">Save User</button>';
     if ($editingUser) { $content .= '<a class="btn secondary" href="index.php?page=users">Cancel</a>'; }
     $content .= '</div></form><h3>Accounts</h3><p><a class="btn' . ($status === 'active' ? '' : ' secondary') . '" href="index.php?page=users&status=active">Active</a> <a class="btn' . ($status === 'inactive' ? '' : ' secondary') . '" href="index.php?page=users&status=inactive">Inactive</a></p><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Action</th></tr></thead><tbody>';
     if ($users === []) { $content .= '<tr><td colspan="4" class="muted">No accounts found.</td></tr>'; }
     foreach ($users as $account) {
-        $content .= '<tr><td>' . e($account['name']) . '</td><td>' . e($account['email']) . '</td><td>' . e($account['role']) . '</td><td><a class="btn secondary" href="index.php?page=users&edit_user=' . (int) $account['id'] . '">Edit</a>';
+        $accountRole = $account['role'] === 'Staff' ? 'Press Operator' : $account['role'];
+        $content .= '<tr><td>' . e($account['name']) . '</td><td>' . e($account['email']) . '</td><td>' . e($accountRole) . '</td><td><a class="btn secondary" href="index.php?page=users&edit_user=' . (int) $account['id'] . '">Edit</a>';
         if ((int) $account['id'] !== (int) $_SESSION['user_id']) {
             $content .= ' <form method="post" style="display:inline">' . $csrfField . '<input type="hidden" name="user_id" value="' . (int) $account['id'] . '"><button class="btn ' . ($status === 'active' ? 'danger' : '') . '" name="toggle_user">' . ($status === 'active' ? 'Deactivate' : 'Reactivate') . '</button></form>';
         }
@@ -1020,33 +1031,63 @@ if ($page === 'security') {
     $content .= '</tbody></table></div>';
 } else {
     $stats = getDashboardStats($db);
-    $lowStock = getLowStockList($db);
-    $latest = getRecentTransactions($db, 5);
+    $lowStock = getLowStockList($db, 4);
+    $startDate = date('Y-m-01', strtotime('-5 months'));
+    $endDate = date('Y-m-d');
+    $movementRows = getStockMovementReport($db, $startDate, $endDate);
+    $byMonth = [];
+    $totalIn = 0;
+    $totalOut = 0;
+    foreach ($movementRows as $row) {
+        $month = $row['month'];
+        $byMonth[$month] ??= ['IN' => 0, 'OUT' => 0];
+        $byMonth[$month][$row['type']] = (int) $row['total_quantity'];
+        if ($row['type'] === 'IN') { $totalIn += (int) $row['total_quantity']; }
+        else { $totalOut += (int) $row['total_quantity']; }
+    }
+    $peak = 1;
+    foreach ($byMonth as $monthData) { $peak = max($peak, $monthData['IN'], $monthData['OUT']); }
 
-    $content = '<div class="dashboard-summary"><h2>Dashboard</h2>';
+    $content = '<div class="dashboard-page"><div class="dashboard-summary"><div class="dashboard-heading"><div><p class="eyebrow">' . ($canViewReports ? 'MANAGEMENT OVERVIEW' : 'OPERATOR OVERVIEW') . '</p><h2>Dashboard</h2></div><span class="dashboard-period">LAST 6 MONTHS</span></div>';
     if ($message) { $content .= '<div class="alert success">' . e($message) . '</div>'; }
     if ($error) { $content .= '<div class="alert error">' . e($error) . '</div>'; }
-    $content .= '<div class="grid two-col"><div class="stat"><h3>In Stock</h3><div class="value">' . $stats['in_stock'] . '</div></div><div class="stat"><h3>Low Stock</h3><div class="value">' . $stats['low_stock'] . '</div></div><div class="stat"><h3>Out of Stock</h3><div class="value">' . $stats['out_of_stock'] . '</div></div><div class="stat"><h3>Total Active Products</h3><div class="value">' . $stats['total'] . '</div></div></div></div>';
+    $content .= '<div class="grid dashboard-stats"><div class="stat"><h3>In Stock</h3><div class="value">' . $stats['in_stock'] . '</div></div><div class="stat"><h3>Low Stock</h3><div class="value">' . $stats['low_stock'] . '</div></div><div class="stat"><h3>Out of Stock</h3><div class="value">' . $stats['out_of_stock'] . '</div></div><div class="stat"><h3>Active Products</h3><div class="value">' . $stats['total'] . '</div></div><div class="stat"><h3>Units In</h3><div class="value">' . $totalIn . '</div></div><div class="stat"><h3>Units Out</h3><div class="value">' . $totalOut . '</div></div></div></div>';
 
-    $content .= '<div class="card"><h3>Low Stock List</h3><table><thead><tr><th>Product</th><th>Supplier</th><th>Qty</th><th>Reorder</th></tr></thead><tbody>';
+    $content .= '<div class="dashboard-lower"><section class="card dashboard-panel"><div class="panel-heading"><h3>Low stock watch</h3><a href="index.php?page=products">View products</a></div><table><thead><tr><th>Product</th><th>Supplier</th><th>Qty / reorder</th></tr></thead><tbody>';
     if (empty($lowStock)) {
-        $content .= '<tr><td colspan="4" class="muted">No low-stock items.</td></tr>';
+        $content .= '<tr><td colspan="3" class="muted">No low-stock items.</td></tr>';
     } else {
         foreach ($lowStock as $row) {
-            $content .= '<tr><td>' . e($row['name']) . '</td><td>' . e($row['supplier_name']) . '</td><td>' . (int) $row['quantity'] . '</td><td>' . (int) $row['reorder_level'] . '</td></tr>';
+            $content .= '<tr><td>' . e($row['name']) . '</td><td>' . e($row['supplier_name']) . '</td><td>' . (int) $row['quantity'] . ' / ' . (int) $row['reorder_level'] . '</td></tr>';
         }
     }
-    $content .= '</tbody></table></div>';
+    $content .= '</tbody></table></section>';
 
-    $content .= '<div class="card"><h3>Recent Transactions</h3><table><thead><tr><th>Product</th><th>Type</th><th>Qty</th><th>After</th><th>Date</th></tr></thead><tbody>';
-    if (empty($latest)) {
-        $content .= '<tr><td colspan="5" class="muted">No transactions yet.</td></tr>';
-    } else {
-        foreach ($latest as $row) {
-            $content .= '<tr><td>' . e($row['product_name']) . '</td><td>' . e($row['type']) . '</td><td>' . (int) $row['quantity'] . '</td><td>' . (int) $row['after_quantity'] . '</td><td>' . e($row['created_at']) . '</td></tr>';
+    if ($canViewReports) {
+        $content .= '<section class="card dashboard-panel"><div class="panel-heading"><h3>Stock flow</h3><a href="index.php?page=reports">Full report</a></div><p class="muted"><span class="legend-in">IN</span> received <span class="legend-out">OUT</span> issued</p>';
+        if ($byMonth === []) {
+            $content .= '<p class="muted">No recorded movement in the last six months.</p>';
+        } else {
+            foreach ($byMonth as $month => $values) {
+                $inWidth = max(1, (int) round($values['IN'] / $peak * 100));
+                $outWidth = max(1, (int) round($values['OUT'] / $peak * 100));
+                $content .= '<div class="dashboard-chart-row"><strong>' . e(date('M y', strtotime($month . '-01'))) . '</strong><div class="chart-track"><div class="chart-bar chart-in" style="width:' . $inWidth . '%"></div></div><span>' . $values['IN'] . '</span><div class="chart-track"><div class="chart-bar chart-out" style="width:' . $outWidth . '%"></div></div><span>' . $values['OUT'] . '</span></div>';
+            }
         }
+        $content .= '</section>';
+    } else {
+        $latest = getRecentTransactions($db, 4);
+        $content .= '<section class="card dashboard-panel"><div class="panel-heading"><h3>Recent operator movements</h3><a href="index.php?page=stock">Open movement desk</a></div><table><thead><tr><th>Product</th><th>Flow</th><th>Qty</th><th>Time</th></tr></thead><tbody>';
+        if (empty($latest)) {
+            $content .= '<tr><td colspan="4" class="muted">No transactions yet.</td></tr>';
+        } else {
+            foreach ($latest as $row) {
+                $content .= '<tr><td>' . e($row['product_name']) . '</td><td class="movement-' . strtolower(e($row['type'])) . '">' . e($row['type']) . '</td><td>' . (int) $row['quantity'] . '</td><td>' . e(date('d M, H:i', strtotime($row['created_at']))) . '</td></tr>';
+            }
+        }
+        $content .= '</tbody></table></section>';
     }
-    $content .= '</tbody></table></div>';
+    $content .= '</div></div>';
 }
 
 // The 2FA handlers above reuse $user for a full database row, so reset it to the minimal layout data.

@@ -593,7 +593,7 @@ function renderNavbar(string $currentPage, array $user): string
         unset($nav['stock']);
     }
     if (in_array($role, ['Admin', 'Manager'], true)) {
-        $nav['reports'] = 'Reports';
+        $nav['reports'] = 'Analytics';
     }
     if ($role === 'Admin') {
         $nav['audit'] = 'Audit Log';

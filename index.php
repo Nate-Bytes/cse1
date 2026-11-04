@@ -791,11 +791,13 @@ if ($page === 'security') {
     $byMonth = [];
     $totalIn = 0;
     $totalOut = 0;
+    $totalMovements = 0;
     foreach ($movementRows as $row) {
         $month = $row['month'];
         $byMonth[$month] ??= ['IN' => 0, 'OUT' => 0, 'count' => 0];
         $byMonth[$month][$row['type']] = (int) $row['total_quantity'];
         $byMonth[$month]['count'] += (int) $row['movement_count'];
+        $totalMovements += (int) $row['movement_count'];
         if ($row['type'] === 'IN') { $totalIn += (int) $row['total_quantity']; }
         else { $totalOut += (int) $row['total_quantity']; }
     }
@@ -809,26 +811,27 @@ if ($page === 'security') {
     );
     $topProductsStmt->execute(['start_date' => $startDate, 'end_date' => $endDate]);
     $topProducts = $topProductsStmt->fetchAll();
+    $inventoryStats = getDashboardStats($db);
 
-    $content = '<div class="report-summary"><h2>Stock Movement Report</h2>';
+    $content = '<div class="analytics-page"><div class="analytics-heading"><div><p class="analytics-kicker">MANAGEMENT / INVENTORY</p><h2>Inventory analytics</h2><p class="muted">Movement for the selected period, alongside today\'s stock position.</p></div>';
+    $content .= '<form method="get" class="analytics-range"><input type="hidden" name="page" value="reports"><div class="field"><label for="report-start">From</label><input id="report-start" type="date" name="start" value="' . e($startDate) . '" required></div><div class="field"><label for="report-end">To</label><input id="report-end" type="date" name="end" value="' . e($endDate) . '" required></div><button class="btn" type="submit">Update</button></form></div>';
     if ($message) { $content .= '<div class="alert success">' . e($message) . '</div>'; }
     if ($error) { $content .= '<div class="alert error">' . e($error) . '</div>'; }
-    $content .= '<form method="get" class="inline"><input type="hidden" name="page" value="reports"><div class="field"><label for="report-start">From</label><input id="report-start" type="date" name="start" value="' . e($startDate) . '" required></div><div class="field"><label for="report-end">To</label><input id="report-end" type="date" name="end" value="' . e($endDate) . '" required></div><button class="btn" type="submit">Apply range</button></form>';
-    $content .= '<div class="grid two-col report-stats"><div class="stat"><h3>Stock In</h3><div class="value">' . $totalIn . '</div></div><div class="stat"><h3>Stock Out</h3><div class="value">' . $totalOut . '</div></div><div class="stat"><h3>Net Movement</h3><div class="value">' . ($totalIn - $totalOut) . '</div></div></div></div>';
-    $content .= '<div class="card"><h3>Monthly movement</h3><p class="muted"><span class="legend-in">■</span> Stock in &nbsp; <span class="legend-out">■</span> Stock out</p>';
+    $content .= '<div class="grid analytics-stats"><div class="stat"><h3>Units received</h3><div class="value">' . $totalIn . '</div><p>Added during this period</p></div><div class="stat"><h3>Units issued</h3><div class="value">' . $totalOut . '</div><p>Removed during this period</p></div><div class="stat"><h3>Net movement</h3><div class="value">' . ($totalIn - $totalOut) . '</div><p>Received minus issued</p></div><div class="stat"><h3>Movements</h3><div class="value">' . $totalMovements . '</div><p>Recorded transactions</p></div></div>';
+    $content .= '<section class="card analytics-flow"><div class="analytics-section-heading"><div><h3>Monthly stock flow</h3><p class="muted">Units received and issued in each month.</p></div><div class="analytics-legend"><span><i class="legend-in"></i>Received</span><span><i class="legend-out"></i>Issued</span></div></div>';
     if ($byMonth === []) {
-        $content .= '<p class="muted">No stock movements in this date range.</p>';
+        $content .= '<p class="analytics-empty">No stock movements were recorded in this date range.</p>';
     } else {
         foreach ($byMonth as $month => $values) {
             $inWidth = max(1, (int) round($values['IN'] / $peak * 100));
             $outWidth = max(1, (int) round($values['OUT'] / $peak * 100));
-            $content .= '<div class="chart-row"><strong>' . e(date('M Y', strtotime($month . '-01'))) . '</strong><div class="chart-track"><div class="chart-bar chart-in" style="width:' . $inWidth . '%"></div></div><span>' . $values['IN'] . '</span><div class="chart-track"><div class="chart-bar chart-out" style="width:' . $outWidth . '%"></div></div><span>' . $values['OUT'] . '</span></div>';
+            $content .= '<div class="analytics-month"><strong class="analytics-month-name">' . e(date('M Y', strtotime($month . '-01'))) . '</strong><div class="analytics-flow-value"><span>Received</span><div class="chart-track"><div class="chart-bar chart-in" style="width:' . $inWidth . '%"></div></div><b>' . $values['IN'] . '</b></div><div class="analytics-flow-value"><span>Issued</span><div class="chart-track"><div class="chart-bar chart-out" style="width:' . $outWidth . '%"></div></div><b>' . $values['OUT'] . '</b></div></div>';
         }
     }
-    $content .= '</div><div class="card"><h3>Most issued items</h3><table><thead><tr><th>Product</th><th>Units issued</th></tr></thead><tbody>';
+    $content .= '</section><div class="grid analytics-lower"><section class="card analytics-position"><h3>Current stock position</h3><p class="muted">Active products, regardless of selected dates.</p><div class="position-list"><div><span>Active products</span><strong>' . $inventoryStats['total'] . '</strong></div><div><span>In stock</span><strong>' . $inventoryStats['in_stock'] . '</strong></div><div><span>Low stock</span><strong>' . $inventoryStats['low_stock'] . '</strong></div><div><span>Out of stock</span><strong>' . $inventoryStats['out_of_stock'] . '</strong></div></div></section><section class="card analytics-products"><h3>Most issued items</h3><p class="muted">Units issued during the selected period.</p><table><thead><tr><th>Product</th><th>Units issued</th></tr></thead><tbody>';
     if ($topProducts === []) { $content .= '<tr><td colspan="2" class="muted">No stock-out records in this range.</td></tr>'; }
     foreach ($topProducts as $product) { $content .= '<tr><td>' . e($product['name']) . '</td><td>' . (int) $product['moved'] . '</td></tr>'; }
-    $content .= '</tbody></table></div>';
+    $content .= '</tbody></table></section></div></div>';
 } elseif ($page === 'audit') {
     $entries = getAuditEntries($db);
     $content = '<div class="card"><h2>Audit Log</h2><p class="muted">Recent catalog, stock, user, and import/export changes. Entries are retained when users or catalog records are deactivated.</p>';
@@ -1064,7 +1067,7 @@ if ($page === 'security') {
     $content .= '</tbody></table></section>';
 
     if ($canViewReports) {
-        $content .= '<section class="card dashboard-panel"><div class="panel-heading"><h3>Stock flow</h3><a href="index.php?page=reports">Full report</a></div><p class="muted"><span class="legend-in">IN</span> received <span class="legend-out">OUT</span> issued</p>';
+        $content .= '<section class="card dashboard-panel"><div class="panel-heading"><h3>Stock flow</h3><a href="index.php?page=reports">View analytics</a></div><p class="muted"><span class="legend-in">IN</span> received <span class="legend-out">OUT</span> issued</p>';
         if ($byMonth === []) {
             $content .= '<p class="muted">No recorded movement in the last six months.</p>';
         } else {

@@ -11,7 +11,7 @@ This project is a small PHP + MySQL inventory app for a printing press business.
 - Product/supplier search, add/edit, deactivate, and restore
 - CSV import/export for products and suppliers
 - Stock-in/stock-out with before/after quantities and transaction history
-- Date-filtered stock reports with monthly movement charts and top issued items
+- Management analytics with date-filtered monthly stock flow, current stock position, and top issued items
 - Admin user creation, editing, password reset, deactivation, and restore
 - Audit log for catalog, stock, user, and import/export changes
 
